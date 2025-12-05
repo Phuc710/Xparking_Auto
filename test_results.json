@@ -1,0 +1,219 @@
+{
+  "summary": {
+    "passed": 26,
+    "failed": 0,
+    "rate": 100.0,
+    "time": "2025-12-02T09:31:37.637399",
+    "test_plate": "TEST-093121",
+    "ticket_code": "VEBBA7952D"
+  },
+  "results": [
+    {
+      "test": "Gateway API accessible",
+      "status": "PASS",
+      "details": {
+        "response": "OK"
+      }
+    },
+    {
+      "test": "Slots Status API",
+      "status": "PASS",
+      "details": {
+        "total_slots": 4,
+        "available": 3
+      }
+    },
+    {
+      "test": "Check Payment API",
+      "status": "PASS",
+      "details": {
+        "accessible": true
+      }
+    },
+    {
+      "test": "Get available slots",
+      "status": "PASS",
+      "details": {
+        "total": 4,
+        "available": 3
+      }
+    },
+    {
+      "test": "Check booking status",
+      "status": "PASS",
+      "details": {
+        "has_booking": false,
+        "booking_id": null
+      }
+    },
+    {
+      "test": "Create ticket",
+      "status": "PASS",
+      "details": {
+        "ticket_code": "VEBBA7952D",
+        "qr_url": "https://xparking.wuaze.com/payment.php?ticket=VEBB..."
+      }
+    },
+    {
+      "test": "Get ticket info",
+      "status": "PASS",
+      "details": {
+        "status": "ACTIVE",
+        "license_plate": "TEST-093121",
+        "time_in": "2025-12-02T02:31:19+00:00"
+      }
+    },
+    {
+      "test": "Vehicle check-in",
+      "status": "PASS",
+      "details": {
+        "vehicle_id": 3,
+        "slot_id": "A02",
+        "license_plate": "TEST-093121"
+      }
+    },
+    {
+      "test": "Slot marked occupied",
+      "status": "PASS",
+      "details": {
+        "slot_id": "A02",
+        "status": "occupied"
+      }
+    },
+    {
+      "test": "Get vehicle by plate",
+      "status": "PASS",
+      "details": {
+        "vehicle": "TEST-093121",
+        "ticket_code": "VEBBA7952D",
+        "slot_id": "A02"
+      }
+    },
+    {
+      "test": "Get ticket details",
+      "status": "PASS",
+      "details": {
+        "status": "ACTIVE",
+        "minutes": 1,
+        "amount": 5000
+      }
+    },
+    {
+      "test": "Verify ticket response format",
+      "status": "PASS",
+      "details": {
+        "is_paid": false,
+        "plate_match": true,
+        "allow_exit": false
+      }
+    },
+    {
+      "test": "Ticket correctly shows unpaid",
+      "status": "PASS",
+      "details": {
+        "amount_due": 5000,
+        "error": "Chưa thanh toán: 5,000đ"
+      }
+    },
+    {
+      "test": "License plate matches",
+      "status": "PASS",
+      "details": {
+        "expected": "TEST-093121"
+      }
+    },
+    {
+      "test": "Checkout denied (unpaid)",
+      "status": "PASS",
+      "details": {
+        "allow_exit": false,
+        "error": "Chưa thanh toán: 5,000đ"
+      }
+    },
+    {
+      "test": "Use ticket denied (unpaid)",
+      "status": "PASS",
+      "details": {
+        "success": false,
+        "error": "Chưa thanh toán: 5,000đ"
+      }
+    },
+    {
+      "test": "Detect wrong license plate",
+      "status": "PASS",
+      "details": {
+        "scanned": "WRONG-999",
+        "expected": "TEST-093121",
+        "plate_match": false
+      }
+    },
+    {
+      "test": "Exit denied for wrong plate",
+      "status": "PASS",
+      "details": {
+        "allow_exit": false,
+        "error": "BSX không khớp"
+      }
+    },
+    {
+      "test": "Get all slots",
+      "status": "PASS",
+      "details": {
+        "count": 4
+      }
+    },
+    {
+      "test": "Update slot to empty",
+      "status": "PASS",
+      "details": {
+        "slot_id": "A02",
+        "new_status": "empty"
+      }
+    },
+    {
+      "test": "Update slot to occupied",
+      "status": "PASS",
+      "details": {
+        "slot_id": "A02",
+        "new_status": "occupied"
+      }
+    },
+    {
+      "test": "Reset slot to empty",
+      "status": "PASS",
+      "details": {
+        "slot_id": "A02"
+      }
+    },
+    {
+      "test": "Check booking (no booking)",
+      "status": "PASS",
+      "details": {
+        "has_booking": false
+      }
+    },
+    {
+      "test": "Get booking (none exists)",
+      "status": "PASS",
+      "details": {
+        "success": false,
+        "error": "No booking found"
+      }
+    },
+    {
+      "test": "Check known plate",
+      "status": "PASS",
+      "details": {
+        "plate": "51G1-999.99",
+        "has_booking": false
+      }
+    },
+    {
+      "test": "Reset test slot",
+      "status": "PASS",
+      "details": {
+        "slot_id": "A02"
+      }
+    }
+  ]
+}
