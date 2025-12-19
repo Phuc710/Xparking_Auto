@@ -19,12 +19,15 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 // Cấu hình email SMTP
 $smtp_config = [
+<<<<<<< HEAD
     'host' => 'mail.xparking.elementfx.com',
     'port' => 587,
     'username' => '',
     'password' => '',
     'from_email' => 'support@xparking.elementfx.com',
     'from_name' => 'XParking Support'
+=======
+>>>>>>> 6652e86a5f05ffaff86d04985182a0cba3007fb9
 ];
 
 // Lấy dữ liệu form
