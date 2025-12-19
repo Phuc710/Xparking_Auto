@@ -7,102 +7,88 @@ require_once 'config.php';
 require_once __DIR__ . '/../api/csdl.php';
 
 /**
- * Lấy tất cả slots với trạng thái thực tế
- * Chỉ hiện: empty (trống), occupied (có xe), maintenance (bảo trì)
- * KHÔNG hiện booking trên slot - booking chỉ đảm bảo capacity
+ * Lấy slot count từ settings table
+ * Returns: ['total' => 50, 'occupied' => 5, 'available' => 45]
+ */
+function get_slot_count() {
+    try {
+        $db = db();
+        
+        $stmt = $db->prepare("SELECT `key`, value FROM settings WHERE `key` IN ('total_slots', 'occupied_slots')");
+        $stmt->execute();
+        $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+        
+        $total = (int)($settings['total_slots'] ?? 50);
+        $occupied = (int)($settings['occupied_slots'] ?? 0);
+        $available = max(0, $total - $occupied);
+        
+        return [
+            'total' => $total,
+            'occupied' => $occupied,
+            'available' => $available,
+            'display' => "$occupied/$total"
+        ];
+    } catch (Exception $e) {
+        error_log("Get slot count error: " . $e->getMessage());
+        return ['total' => 50, 'occupied' => 0, 'available' => 50, 'display' => '0/50'];
+    }
+}
+
+/**
+ * Legacy - get_all_slots now returns slot count info
  */
 function get_all_slots() {
-    try {
-        $db = db();
-        
-        // Lấy tất cả parking slots (sử dụng index idx_parking_status)
-        $stmt = $db->prepare("SELECT * FROM parking_slots ORDER BY id");
-        $stmt->execute();
-        $slots = $stmt->fetchAll();
-        
-        // Lấy vehicles đang trong bãi (sử dụng index idx_vehicles_status)
-        $stmt = $db->prepare("SELECT * FROM vehicles WHERE status = 'in_parking'");
-        $stmt->execute();
-        $vehicles = $stmt->fetchAll();
-        
-        // Map vehicles theo slot_id
-        $vehicleMap = [];
-        foreach ($vehicles as $v) {
-            if ($v['slot_id']) {
-                $vehicleMap[$v['slot_id']] = $v;
-            }
-        }
-        
-        // Xác định trạng thái thực tế cho mỗi slot
-        $result = [];
-        foreach ($slots as $slot) {
-            $slotId = $slot['id'];
-            
-            // Chỉ 3 trạng thái: occupied, maintenance, empty
-            if (isset($vehicleMap[$slotId])) {
-                $slot['actual_status'] = 'occupied';
-                // Thông tin cho Admin (không hiện cho User)
-                $slot['vehicle_license'] = $vehicleMap[$slotId]['license_plate'];
-                $slot['ticket_code'] = $vehicleMap[$slotId]['ticket_code'] ?? null;
-                $slot['entry_time'] = $vehicleMap[$slotId]['entry_time'] ?? null;
-            } elseif ($slot['status'] === 'maintenance') {
-                $slot['actual_status'] = 'maintenance';
-            } else {
-                $slot['actual_status'] = 'empty';
-            }
-            
-            $result[] = $slot;
-        }
-        
-        return $result;
-    } catch (Exception $e) {
-        error_log("Get slots display error: " . $e->getMessage());
-        return [];
-    }
+    return get_slot_count();
 }
 
 /**
- * Lấy slots trống (available)
+ * Lấy số slots trống (available count)
  */
 function get_available_slots() {
-    try {
-        $allSlots = get_all_slots();
-        
-        return array_filter($allSlots, function($slot) {
-            return $slot['actual_status'] === 'empty';
-        });
-    } catch (Exception $e) {
-        error_log("Get available slots error: " . $e->getMessage());
-        return [];
-    }
+    $count = get_slot_count();
+    return $count['available'];
 }
 
 /**
- * Lấy slot theo ID
+ * Deprecated - slot không còn theo ID
  */
 function get_slot($slot_id) {
+    // Return global slot count
+    return get_slot_count();
+}
+
+/**
+ * Deprecated - slot status managed by increment/decrement
+ */
+function update_slot_status($slot_id, $status) {
+    // No longer used - use increment_slot or decrement_slot
+    return true;
+}
+
+/**
+ * Increment slot (+1 khi xe vào)
+ */
+function increment_slot() {
     try {
         $db = db();
-        $stmt = $db->prepare("SELECT * FROM parking_slots WHERE id = ?");
-        $stmt->execute([$slot_id]);
-        return $stmt->fetch() ?: false;
+        $stmt = $db->prepare("UPDATE settings SET value = CAST(CAST(value AS UNSIGNED) + 1 AS CHAR) WHERE `key` = 'occupied_slots'");
+        return $stmt->execute();
     } catch (Exception $e) {
-        error_log("Get slot error: " . $e->getMessage());
+        error_log("Increment slot error: " . $e->getMessage());
         return false;
     }
 }
 
 /**
- * Cập nhật trạng thái slot
+ * Decrement slot (-1 khi xe ra)
  */
-function update_slot_status($slot_id, $status) {
+function decrement_slot() {
     try {
         $db = db();
-        $stmt = $db->prepare("UPDATE parking_slots SET status = ?, updated_at = ? WHERE id = ?");
-        $result = $stmt->execute([$status, date('Y-m-d H:i:s'), $slot_id]);
-        return $result;
+        $stmt = $db->prepare("UPDATE settings SET value = CAST(GREATEST(CAST(value AS UNSIGNED) - 1, 0) AS CHAR) WHERE `key` = 'occupied_slots'");
+        return $stmt->execute();
     } catch (Exception $e) {
-        error_log("Update slot error: " . $e->getMessage());
+        error_log("Decrement slot error: " . $e->getMessage());
         return false;
     }
 }
@@ -131,26 +117,25 @@ function create_booking($user_id, $license_plate, $start_time, $end_time) {
             return ['success' => false, 'message' => 'Thời gian kết thúc phải sau thời gian bắt đầu!'];
         }
         
-        // === KIỂM TRA CHỖ TRỐNG - MySQL ===
+        // === KIỂM TRA CHỖ TRỐNG - SIMPLIFIED ===
         $db = db();
         
-        // Đếm slot khả dụng (sử dụng index idx_parking_status)
-        $stmt = $db->prepare("SELECT COUNT(*) FROM parking_slots WHERE status != 'maintenance'");
-        $stmt->execute();
-        $available_slots = $stmt->fetchColumn();
+        // Lấy slot count từ settings
+        $slot_count = get_slot_count();
+        $total_slots = $slot_count['total'];
+        $occupied = $slot_count['occupied'];
         
-        if ($available_slots == 0) {
-            return ['success' => false, 'message' => 'Tất cả chỗ đỗ đang bảo trì!'];
-        }
-        
-        // Đếm bookings đang active (sử dụng index idx_bookings_status)
+        // Đếm bookings đang pending (chưa vào bãi)
         $stmt = $db->prepare("SELECT COUNT(*) FROM bookings WHERE status IN ('pending', 'confirmed')");
         $stmt->execute();
-        $reserved_count = $stmt->fetchColumn();
+        $reserved_count = (int)$stmt->fetchColumn();
+        
+        // Tổng slot đang dùng = occupied (đã vào) + reserved (booking pending)
+        $total_used = $occupied + $reserved_count;
         
         // Kiểm tra còn chỗ không
-        if ($reserved_count >= $available_slots) {
-            return ['success' => false, 'message' => 'Hết chỗ trống! Vui lòng thử lại sau.'];
+        if ($total_used >= $total_slots) {
+            return ['success' => false, 'message' => "Hết chỗ trống! ({$total_used}/{$total_slots})"];
         }
         
         // === TÍNH PHÍ ===

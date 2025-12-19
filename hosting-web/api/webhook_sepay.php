@@ -81,7 +81,7 @@ webhook_log("Codes: ticket=$ticket_code, payment=$payment_code, overstay=$overst
 if ($ticket_code) {
     $ticket = dbGetOne('tickets', 'ticket_code', $ticket_code);
     
-    if (!$ticket || !in_array($ticket['status'], ['ACTIVE', 'PENDING'])) {
+    if (!$ticket || $ticket['status'] !== 'PENDING') {
         webhook_log("Ticket invalid: $ticket_code");
         respond(true, 'Ticket invalid');
     }

@@ -62,10 +62,11 @@ function get_user_statistics($user_id) {
 }
 
 /**
- * Lấy trạng thái slots (Wrapper)
+ * Lấy trạng thái slots - SIMPLIFIED
+ * Returns: ['total' => 50, 'occupied' => 5, 'available' => 45, 'display' => '5/50']
  */
 function get_slots_display_status() {
-    return get_all_slots();
+    return get_slot_count();
 }
 
 /**
@@ -81,15 +82,10 @@ function get_user_vehicles($user_id) {
 }
 
 /**
- * Lấy slots trống (cho trang booking)
+ * Lấy slots trống (cho trang booking) - SIMPLIFIED
+ * Returns available count
  */
 function get_booking_available_slots() {
-    try {
-        $db = db();
-        $stmt = $db->prepare("SELECT * FROM parking_slots WHERE status = 'empty'");
-        $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    } catch (Exception $e) {
-        return [];
-    }
+    $count = get_slot_count();
+    return $count['available'];
 }

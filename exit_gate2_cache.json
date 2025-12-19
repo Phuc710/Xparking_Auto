@@ -1,0 +1,25 @@
+{
+  "plate": "84H153236",
+  "timestamp": 1765955369.0544653,
+  "api_data": {
+    "success": true,
+    "found": true,
+    "ticket_code": "VEFEA72812",
+    "license_plate": "84H153236",
+    "vehicle_id": 7,
+    "slot_id": null,
+    "status": "PENDING",
+    "time_in": "2025-12-17 14:08:28",
+    "time_out": null,
+    "minutes": 1,
+    "amount": 5000,
+    "has_overstay": false,
+    "overstay_minutes": 0,
+    "overstay_amount": 0,
+    "overstay_payment_ref": null,
+    "booking_id": null,
+    "is_booking": false,
+    "allow_exit": false,
+    "error_reason": "PAYMENT_PENDING"
+  }
+}

@@ -1,6 +1,7 @@
 /**
- * ESP32_gate2 
- * Hardware: 2 OLEDs (2 I2C), 2 IRs, 2 Servos, 4 Slots, 1 Smoke
+ * ESP32_GATE2 - SIMPLIFIED (No IR Slot Sensors)
+ * Hardware: 2 OLEDs (2 I2C), 2 IRs, 2 Servos, 1 Smoke
+ * Slot: Managed by Python server (IN +1, OUT -1)
  */
 
 #include <Wire.h>
@@ -26,8 +27,6 @@
 #define SDA_EXIT 18
 #define SCL_EXIT 19
 
-const int SLOT_PINS[4] = {25, 26, 33, 14};
-
 // === OLED ===
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -40,9 +39,9 @@ Adafruit_SSD1306 oled_in(SCREEN_WIDTH, SCREEN_HEIGHT, &I2C_entrance, -1);
 Adafruit_SSD1306 oled_out(SCREEN_WIDTH, SCREEN_HEIGHT, &I2C_exit, -1);
 
 // === CONFIG ===
-const char* WIFI_SSID = "MUOI CA PHE CN2";
-const char* WIFI_PASS = "68686868";
-const char* MQTT_SERVER = "192.168.1.127";
+const char* WIFI_SSID = "Wifi chùa";
+const char* WIFI_PASS = "3thanghe";
+const char* MQTT_SERVER = "10.105.11.197";
 const int MQTT_PORT = 1883;
 
 // === OBJECTS ===
@@ -52,20 +51,18 @@ Servo servoIn;
 Servo servoOut;
 
 // === TIMING ===
-const unsigned long IR_STABLE_TIME = 500;
-const unsigned long SLOT_MONITOR_TIMEOUT = 10000;
+const unsigned long IR_STABLE_TIME = 1000;
 const unsigned long STATUS_REPORT_INTERVAL = 5000;
 const unsigned long AUTO_CLOSE_DELAY = 500;
 const unsigned long PROCESSING_TIMEOUT = 15000;
 const unsigned long BARRIER_TIMEOUT = 20000;
-const unsigned long VERIFY_TIMEOUT = 30000;
+const unsigned long VERIFY_TIMEOUT = 20000;
 const int SMOKE_THRESHOLD = 6000;
 
 // === STATE IN ===
 enum StateIn {
   IN_IDLE,
   IN_PROCESSING_ENTRY,
-  IN_WAITING_FOR_SLOT,
   IN_BARRIER_OPEN_WAITING_PASS
 };
 StateIn stateIn = IN_IDLE;
@@ -84,18 +81,13 @@ bool barrierOutOpen = false;
 bool carPassedIn = false;
 bool carPassedOut = false;
 bool emergencyActive = false;
-bool isMonitoringSlots = false;
 
 unsigned long stateInStartTime = 0;
 unsigned long stateOutStartTime = 0;
 unsigned long carPassTimeIn = 0;
 unsigned long carPassTimeOut = 0;
 unsigned long lastDetectOut = 0;
-unsigned long slotMonitorStartTime = 0;
 unsigned long lastStatusReport = 0;
-
-int emptySlotsToMonitor = 0;
-int slotsToMonitor[4];
 
 // === TOPICS ===
 const char* T_ENTRANCE = "xparking/gate2/entrance";
@@ -119,7 +111,6 @@ void reconnect();
 void handleIRIn();
 void handleIROut();
 void handleAutoCloseBarriers();
-void handleSlotMonitoring();
 void handleStatusReporting();
 void resetInToIdle();
 void resetOutToIdle();
@@ -147,7 +138,7 @@ void showOLED(Adafruit_SSD1306 &oled, String l1, String l2) {
 // === BARRIER ===
 void openBarrierIn() {
   if (!barrierInOpen) {
-    servoIn.write(90);
+    servoIn.write(0);  // 0° = MỞ
     barrierInOpen = true;
     carPassedIn = false;
     Serial.println("[IN] Barrier OPEN");
@@ -156,7 +147,7 @@ void openBarrierIn() {
 
 void closeBarrierIn() {
   if (barrierInOpen) {
-    servoIn.write(0);
+    servoIn.write(90);  // 90° = ĐÓNG
     barrierInOpen = false;
     Serial.println("[IN] Barrier CLOSE");
     if (!emergencyActive) showOLED(oled_in, "X PARKING", "Entrance");
@@ -165,7 +156,7 @@ void closeBarrierIn() {
 
 void openBarrierOut() {
   if (!barrierOutOpen) {
-    servoOut.write(90);
+    servoOut.write(0);  // 0° = MỞ
     barrierOutOpen = true;
     carPassedOut = false;
     Serial.println("[OUT] Barrier OPEN");
@@ -174,7 +165,7 @@ void openBarrierOut() {
 
 void closeBarrierOut() {
   if (barrierOutOpen) {
-    servoOut.write(0);
+    servoOut.write(90);  // 90° = ĐÓNG
     barrierOutOpen = false;
     Serial.println("[OUT] Barrier CLOSE");
     if (!emergencyActive) showOLED(oled_out, "X PARKING", "Exit");
@@ -195,33 +186,18 @@ void publishMessage(String topic, String event, String data) {
 }
 
 void publishStatus() {
-  int occupiedSlotsCount = 0;
-  for (int i = 0; i < 4; i++) {
-    if (digitalRead(SLOT_PINS[i]) == LOW) occupiedSlotsCount++;
-  }
-  
-  StaticJsonDocument<700> doc;
+  StaticJsonDocument<300> doc;
   doc["event"] = "STATUS_REPORT";
-  doc["station"] = "gate2";
+  doc["station"] = "GATE2";
   doc["state_in"] = (int)stateIn;
   doc["state_out"] = (int)stateOut;
   doc["emergency"] = emergencyActive;
   doc["barrier_in_open"] = barrierInOpen;
   doc["barrier_out_open"] = barrierOutOpen;
-  doc["monitoring_slots"] = isMonitoringSlots;
-  doc["occupied_slots"] = occupiedSlotsCount;
-  doc["available_slots"] = 4 - occupiedSlotsCount;
   doc["smoke_level"] = analogRead(SMOKE_PIN);
   doc["timestamp"] = millis();
   
-  JsonArray slots = doc.createNestedArray("slot_status");
-  for (int i = 0; i < 4; i++) {
-    JsonObject slot = slots.createNestedObject();
-    slot["id"] = String("A0") + String(i + 1);
-    slot["occupied"] = digitalRead(SLOT_PINS[i]) == LOW;
-  }
-  
-  char buffer[800];
+  char buffer[400];
   serializeJson(doc, buffer);
   mqtt.publish(T_STATUS, buffer);
 }
@@ -262,44 +238,18 @@ void onMessage(char* topic, byte* payload, unsigned int len) {
   String event = doc["event"] | "";
   String station = doc["station"] | "";
   
-  if (station == "IN" || event == "OPEN_BARRIER" || event == "MONITOR_SLOTS" || event == "SHOW_MESSAGE_IN") {
+  if (station == "IN" || event == "OPEN_BARRIER" || event == "SHOW_MESSAGE_IN") {
     if (event == "OPEN_BARRIER") {
       openBarrierIn();
       stateIn = IN_BARRIER_OPEN_WAITING_PASS;
       stateInStartTime = millis();
       publishMessage(T_ENTRANCE, "BARRIER_OPENED");
     }
-    else if (event == "MONITOR_SLOTS") {
-      isMonitoringSlots = true;
-      slotMonitorStartTime = millis();
-      if (stateIn != IN_BARRIER_OPEN_WAITING_PASS) stateIn = IN_WAITING_FOR_SLOT;
-      emptySlotsToMonitor = 0;
-      
-      if (doc.containsKey("slots") && doc["slots"].is<JsonArray>()) {
-        JsonArray slots = doc["slots"].as<JsonArray>();
-        for (JsonVariant slot : slots) {
-          String slot_id = slot.as<String>();
-          for (int i = 0; i < 4; i++) {
-            if (slot_id == "A0" + String(i + 1)) {
-              if (emptySlotsToMonitor < 4) {
-                slotsToMonitor[emptySlotsToMonitor++] = SLOT_PINS[i];
-              }
-              break;
-            }
-          }
-        }
-      }
-    }
     else if (event == "SHOW_MESSAGE_IN") {
       showOLED(oled_in, doc["line1"] | "", doc["line2"] | "");
     }
     else if (event == "RESET_IN") {
       resetInToIdle();
-    }
-    else if (event == "STOP_SLOT_MONITOR") {
-      isMonitoringSlots = false;
-      if (!emergencyActive) stateIn = IN_IDLE;
-      emptySlotsToMonitor = 0;
     }
   }
   else if (station == "OUT" || event == "DISPLAY_OUT" || event == "BARRIER_OUT") {
@@ -435,53 +385,23 @@ void handleIROut() {
 }
 
 void handleAutoCloseBarriers() {
+  // Xe VÀO - barrier close sau khi xe qua → gửi CAR_ENTERED
   if (barrierInOpen && carPassedIn && millis() - carPassTimeIn >= AUTO_CLOSE_DELAY) {
     closeBarrierIn();
-    if (!emergencyActive && (stateIn == IN_WAITING_FOR_SLOT || stateIn == IN_BARRIER_OPEN_WAITING_PASS)) {
-      stateIn = IN_IDLE;
-    }
+    publishMessage(T_ENTRANCE, "CAR_ENTERED");  // Python sẽ +1 slot
+    Serial.println("[IN] Xe da vao - Slot +1");
+    stateIn = IN_IDLE;
     carPassedIn = false;
   }
   
+  // Xe RA - barrier close sau khi xe qua → gửi CAR_EXITED
   if (barrierOutOpen && carPassedOut && millis() - carPassTimeOut >= AUTO_CLOSE_DELAY) {
     closeBarrierOut();
-    publishMessage(T_EXIT, "CAR_EXITED");
-    Serial.println("[OUT] Xe da ra");
+    publishMessage(T_EXIT, "CAR_EXITED");  // Python sẽ -1 slot
+    Serial.println("[OUT] Xe da ra - Slot -1");
     carPassedOut = false;
     stateOut = OUT_IDLE;
     showOLED(oled_out, "X PARKING", "Exit");
-  }
-}
-
-void handleSlotMonitoring() {
-  if (!isMonitoringSlots) return;
-  
-  if (millis() - slotMonitorStartTime > SLOT_MONITOR_TIMEOUT) {
-    Serial.println("[gate2] Slot monitor timeout");
-    isMonitoringSlots = false;
-    if (!emergencyActive) stateIn = IN_IDLE;
-    emptySlotsToMonitor = 0;
-    publishMessage(T_SLOTS, "MONITOR_TIMEOUT");
-    return;
-  }
-  
-  for (int i = 0; i < emptySlotsToMonitor; i++) {
-    if (digitalRead(slotsToMonitor[i]) == LOW) {
-      delay(200);
-      if (digitalRead(slotsToMonitor[i]) == LOW) {
-        for (int j = 0; j < 4; j++) {
-          if (slotsToMonitor[i] == SLOT_PINS[j]) {
-            String slotId = "A0" + String(j + 1);
-            Serial.print("[gate2] Xe vao slot: "); Serial.println(slotId);
-            publishMessage(T_SLOTS, "CAR_ENTERED_SLOT", slotId);
-            isMonitoringSlots = false;
-            emptySlotsToMonitor = 0;
-            if (!emergencyActive) stateIn = IN_IDLE;
-            return;
-          }
-        }
-      }
-    }
   }
 }
 
@@ -494,8 +414,6 @@ void handleStatusReporting() {
 
 void resetInToIdle() {
   stateIn = IN_IDLE;
-  isMonitoringSlots = false;
-  emptySlotsToMonitor = 0;
   carPassedIn = false;
   if (barrierInOpen && !emergencyActive) closeBarrierIn();
   showOLED(oled_in, "X PARKING", "Entrance");
@@ -531,16 +449,28 @@ void setup() {
   pinMode(IR_IN_PIN, INPUT_PULLUP);
   pinMode(IR_OUT_PIN, INPUT_PULLUP);
   pinMode(SMOKE_PIN, INPUT);
-  for (int i = 0; i < 4; i++) pinMode(SLOT_PINS[i], INPUT_PULLUP);
   
-  ESP32PWM::allocateTimer(0);
+ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
+  
   servoIn.setPeriodHertz(50);
   servoIn.attach(SERVO_IN_PIN, 500, 2500);
+  servoIn.write(90);  // 90° = ĐÓNG (khởi tạo barrier đóng)
+  
   servoOut.setPeriodHertz(50);
   servoOut.attach(SERVO_OUT_PIN, 500, 2500);
-  servoIn.write(0);
-  servoOut.write(0);
+  servoOut.write(90);  // 90° = ĐÓNG (khởi tạo barrier đóng)
+  
+  // Chờ servo ổn định
+  delay(500);
+  
+  // Đảm bảo biến trạng thái khớp với phần cứng
+  barrierInOpen = false;
+  barrierOutOpen = false;
+  carPassedIn = false;
+  carPassedOut = false;
+  stateIn = IN_IDLE;
+  stateOut = OUT_IDLE;
   
   I2C_entrance.begin(SDA_ENTRANCE, SCL_ENTRANCE, 100000);
   I2C_exit.begin(SDA_EXIT, SCL_EXIT, 100000);
@@ -579,7 +509,6 @@ void loop() {
     handleIRIn();
     handleIROut();
     handleAutoCloseBarriers();
-    handleSlotMonitoring();
   }
   
   checkSmokeSensor();

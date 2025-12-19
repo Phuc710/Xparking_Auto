@@ -1,21 +1,26 @@
 /**
- * ESP32_CAM_GATE1 - Camera cho XPARKING Gate 1
- * Chup BSX + QR code gui ve Python qua MQTT
- * Che do tiet kiem: Chi bat len khi co trigger
+ * ESP32-CAM Gate1 - HTTP Server Mode
+ * CHỈ DÙNG CHO ENTRY (nhận diện BSX xe vào)
+ * Python GET http://192.168.1.205/capture để lấy ảnh JPEG
+ * 
+ * Endpoints:
+ *   GET /capture  - Chụp và trả về ảnh JPEG
+ *   GET /status   - Trạng thái camera (JSON)
  */
 
 #include <WiFi.h>
-#include <PubSubClient.h>
 #include "esp_camera.h"
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
+#include "esp_http_server.h"
 
-// WiFi & MQTT
-const char* WIFI_SSID = "MUOI CA PHE CN2";
-const char* WIFI_PASS = "68686868";
-const char* MQTT_SERVER = "192.168.1.127";
-const int MQTT_PORT = 1883;
-const int MQTT_BUFFER = 50000;
+// ========== CONFIG ==========
+const char* ssid = "Wifi chùa";
+const char* password = "3thanghe";
+
+// Static IP for Gate 1
+IPAddress local_IP(10, 105, 11, 205);    // ĐỔI: 192.168.1.205 → 10.105.11.205
+IPAddress gateway(10, 105, 11, 132);     // Gateway của bạn (từ ipconfig)
+IPAddress subnet(255, 255, 255, 0);      // Giữ nguyên
+IPAddress dns(8, 8, 8, 8);               // Giữ nguyên
 
 // Camera pins (AI-Thinker)
 #define PWDN_GPIO_NUM     32
@@ -34,20 +39,12 @@ const int MQTT_BUFFER = 50000;
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
+#define FLASH_GPIO_NUM     4
 
-// Flash LED
-#define FLASH_GPIO_NUM    4
+httpd_handle_t server = NULL;
+int captureCount = 0;
 
-WiFiClient espClient;
-PubSubClient mqtt(espClient);
-
-const char* T_TRIGGER = "xparking/gate1/cam/trigger";
-const char* T_IMAGE = "xparking/gate1/cam/image";
-const char* T_STATUS = "xparking/gate1/cam/status";
-
-bool captureRequested = false;
-bool cameraActive = false;
-
+// ========== CAMERA SETUP ==========
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -70,166 +67,160 @@ void setupCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  
-  // Toi uu cho QR: VGA, quality 12
-  config.frame_size = FRAMESIZE_VGA;
+  config.frame_size = FRAMESIZE_VGA;  // 640x480
   config.jpeg_quality = 12;
-  config.fb_count = psramFound() ? 2 : 1;
-  
+  config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
   if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("Cam init fail");
+    Serial.println("Camera FAILED!");
     return;
   }
   
-  // Toi uu cho QR scan
-  sensor_t *s = esp_camera_sensor_get();
-  s->set_brightness(s, 0);
-  s->set_contrast(s, 1);
-  s->set_saturation(s, 0);
-  s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 1);
-  s->set_exposure_ctrl(s, 1);
-  s->set_aec_value(s, 300);
-  s->set_gain_ctrl(s, 1);
-  s->set_hmirror(s, 0);
-  s->set_vflip(s, 0);
-  
-  Serial.println("Cam OK");
-}
-
-void onMessage(char* topic, byte* payload, unsigned int len) {
-  if (String(topic) == T_TRIGGER && len >= 7) {
-    if (strncmp((char*)payload, "capture", 7) == 0) {
-      captureRequested = true;
+  // Warm up camera - take 5 dummy frames
+  Serial.print("Warming up camera");
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      esp_camera_fb_return(fb);
+      Serial.print(".");
     }
-  }
-}
-
-void wakeCamera() {
-  if (!cameraActive) {
-    digitalWrite(PWDN_GPIO_NUM, LOW);
     delay(100);
-    cameraActive = true;
-    Serial.println("Cam ON");
   }
-}
-
-void sleepCamera() {
-  if (cameraActive) {
-    digitalWrite(PWDN_GPIO_NUM, HIGH);
-    cameraActive = false;
-    Serial.println("Cam OFF");
-  }
-}
-
-void captureAndSend() {
-  wakeCamera();
   
-  // Flash ON
+  Serial.println(" OK");
+}
+
+// ========== HTTP HANDLER: /capture ==========
+static esp_err_t capture_handler(httpd_req_t *req) {
+  Serial.println("\n=== CAPTURE REQUEST ===");
+  
+  // 1. Clear old buffers
+  Serial.println("Clearing old buffers...");
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t *old = esp_camera_fb_get();
+    if (old) {
+      esp_camera_fb_return(old);
+      Serial.printf("  Cleared buffer %d\n", i+1);
+    }
+    delay(30);
+  }
+  
+  // 2. Flash ON
   digitalWrite(FLASH_GPIO_NUM, HIGH);
   delay(100);
   
-  Serial.print("Chup anh...");
+  // 3. Capture new frame
+  Serial.println("Capturing new image...");
   camera_fb_t *fb = esp_camera_fb_get();
   
-  // Flash OFF
+  // 4. Flash OFF
   digitalWrite(FLASH_GPIO_NUM, LOW);
   
   if (!fb) {
-    Serial.println("FAIL");
-    mqtt.publish(T_STATUS, "fail");
-    sleepCamera();
-    return;
+    Serial.println("[ERR] Capture FAILED");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
   }
   
-  Serial.printf("OK %dKB\n", fb->len / 1024);
+  captureCount++;
+  Serial.printf("[OK] Captured: %d bytes (#%d)\n", fb->len, captureCount);
   
-  // Gui anh qua MQTT
-  if (mqtt.publish(T_IMAGE, fb->buf, fb->len)) {
-    Serial.println("Gui anh OK");
-    mqtt.publish(T_STATUS, "sent");
-  } else {
-    Serial.println("Gui anh FAIL");
-    mqtt.publish(T_STATUS, "send_fail");
-  }
+  // 5. Send JPEG response
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
   
+  // 6. Release buffer
   esp_camera_fb_return(fb);
   
-  // Delay 1s roi chup tiep (cho QR)
-  delay(1000);
-  
-  // Chup anh thu 2 (QR)
-  digitalWrite(FLASH_GPIO_NUM, HIGH);
-  delay(100);
-  
-  fb = esp_camera_fb_get();
-  digitalWrite(FLASH_GPIO_NUM, LOW);
-  
-  if (fb) {
-    Serial.printf("Chup QR: %dKB\n", fb->len / 1024);
-    mqtt.publish(T_IMAGE, fb->buf, fb->len);
-    esp_camera_fb_return(fb);
+  if (res == ESP_OK) {
+    Serial.println("[OK] Image sent\n");
   }
   
-  sleepCamera();
+  return res;
 }
 
-void reconnect() {
-  while (!mqtt.connected()) {
-    Serial.print("MQTT...");
-    String id = "CAM_" + String(random(0xffff), HEX);
-    if (mqtt.connect(id.c_str())) {
-      Serial.println("OK");
-      mqtt.subscribe(T_TRIGGER);
-      mqtt.publish(T_STATUS, "online");
-    } else {
-      Serial.println("FAIL");
-      delay(2000);
-    }
+// ========== HTTP HANDLER: /status ==========
+static esp_err_t status_handler(httpd_req_t *req) {
+  char json[200];
+  snprintf(json, sizeof(json),
+    "{\"ip\":\"%s\",\"gate\":1,\"captures\":%d,\"rssi\":%d}",
+    WiFi.localIP().toString().c_str(),
+    captureCount,
+    WiFi.RSSI()
+  );
+  
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json, strlen(json));
+}
+
+// ========== START HTTP SERVER ==========
+void startServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  
+  httpd_uri_t capture_uri = {
+    .uri = "/capture",
+    .method = HTTP_GET,
+    .handler = capture_handler
+  };
+  
+  httpd_uri_t status_uri = {
+    .uri = "/status",
+    .method = HTTP_GET,
+    .handler = status_handler
+  };
+  
+  if (httpd_start(&server, &config) == ESP_OK) {
+    httpd_register_uri_handler(server, &capture_uri);
+    httpd_register_uri_handler(server, &status_uri);
+    Serial.println("[OK] Server started");
   }
 }
 
+// ========== SETUP ==========
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
-  Serial.println("\n=== ESP32-CAM GATE1 ===");
+  Serial.println("\n================================");
+  Serial.println("ESP32-CAM GATE1 - HTTP Server");
+  Serial.println("================================\n");
   
-  // Setup flash LED
+  // Flash
   pinMode(FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(FLASH_GPIO_NUM, LOW);
   
-  // Setup camera power
-  pinMode(PWDN_GPIO_NUM, OUTPUT);
-  digitalWrite(PWDN_GPIO_NUM, HIGH);  // Start in sleep mode
-  
+  // Camera
   setupCamera();
-  sleepCamera();  // Sleep sau khi init
   
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi...");
-  while (WiFi.status() != WL_CONNECTED) { 
-    delay(500); 
-    Serial.print("."); 
+  // Static IP
+  if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+    Serial.println("[WARN] Static IP failed");
   }
-  Serial.println("OK");
-  Serial.println("IP: " + WiFi.localIP().toString());
   
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
-  mqtt.setBufferSize(MQTT_BUFFER);
-  mqtt.setCallback(onMessage);
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
   
-  Serial.println("Ready (Sleep mode)\n");
+  Serial.println("\n[OK] WiFi connected!");
+  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Signal: %d dBm\n\n", WiFi.RSSI());
+  
+  // Server
+  startServer();
+  
+  Serial.println("================================");
+  Serial.println("READY!");
+  Serial.println("GET /capture - Capture image");
+  Serial.println("GET /status  - Get status");
+  Serial.println("================================\n");
 }
 
+// ========== LOOP ==========
 void loop() {
-  if (!mqtt.connected()) reconnect();
-  mqtt.loop();
-  
-  if (captureRequested) {
-    captureRequested = false;
-    captureAndSend();
-  }
-  
-  delay(10);
+  delay(100);
 }
-

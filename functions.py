@@ -40,7 +40,7 @@ class ExitCacheManager:
             if cache.get('plate') == plate:
                 cached_time = cache.get('timestamp', 0)
                 if time.time() - cached_time < cls.CACHE_TIMEOUT:
-                    logger.info(f"[GATE{gate}] 📦 Cache HIT: {plate}")
+                    logger.info(f"[GATE{gate}]  Cache HIT: {plate}")
                     return cache.get('api_data')
             
             return None
@@ -60,7 +60,7 @@ class ExitCacheManager:
             }
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
-            logger.info(f"[GATE{gate}] 📦 Cache SAVED: {plate}")
+            logger.info(f"[GATE{gate}]  Cache SAVED: {plate}")
         except Exception as e:
             logger.warning(f"[GATE{gate}] Cache write error: {e}")
     
@@ -72,58 +72,43 @@ class ExitCacheManager:
             if os.path.exists(cache_file):
                 with open(cache_file, 'w', encoding='utf-8') as f:
                     json.dump({}, f)
-                logger.info(f"[GATE{gate}] 📦 Cache CLEARED")
+                logger.info(f"[GATE{gate}]  Cache CLEARED")
         except Exception as e:
             logger.warning(f"[GATE{gate}] Cache clear error: {e}")
 
 class SystemFunctions:
-    def __init__(self, config, gui, lpr, db_api, email_handler):
+    def __init__(self, config, camera, lpr, db_api, email_handler):
         self.config = config
-        self.gui = gui
+        self.camera = camera
         self.lpr = lpr
         self.db = db_api
         self.email = email_handler
         
-        # Dual gate MQTT handlers
         from mqtt_gate1 import MQTTGate1
         from mqtt_gate2 import MQTTGate2
         self.mqtt_gate1 = MQTTGate1(config, self)
         self.mqtt_gate2 = MQTTGate2(config, self)
         
-        # Thread pool cho xu ly song song
         self.executor = ThreadPoolExecutor(max_workers=8)
         
-        # Locks rieng cho tung gate
         self.gate1_entry_lock = threading.Lock()
         self.gate1_exit_lock = threading.Lock()
         self.gate2_entry_lock = threading.Lock()
         self.gate2_exit_lock = threading.Lock()
         
-        # Image uploader
         self.img_uploader = ImageUploader(config.config['site_url'])
-        
-        # Ticket Manager
         self.ticket_manager = TicketManager(db_api)
-        
-        # Gate2 state
-        self.config.waiting_for_qr_gate2 = False
-        self.config.current_exit_plate_gate2 = None
-        self.config.qr_scan_result_gate2 = None
 
-    # === MQTT ===
     def init_mqtt(self):
-        """Khoi tao MQTT cho ca 2 gates"""
+        """Khởi tạo MQTT"""
         try:
-            gate1_ok = self.mqtt_gate1.connect()
-            gate2_ok = self.mqtt_gate2.connect()
-            
-            if gate1_ok and gate2_ok:
-                logger.info("✅ Dual Gate MQTT connected")
-                self.gui.update_status('mqtt_status', True)
+            g1 = self.mqtt_gate1.connect()
+            g2 = self.mqtt_gate2.connect()
+            if g1 and g2:
+                logger.info("MQTT: Gate1=OK, Gate2=OK")
                 return True
-            else:
-                logger.error("❌ MQTT connection failed")
-                return False
+            logger.error("MQTT connection failed")
+            return False
         except Exception as e:
             logger.error(f"MQTT error: {e}")
             return False
@@ -143,155 +128,221 @@ class SystemFunctions:
         else:
             self.mqtt_gate2.barrier(station, action)
     
-    def _trigger_camera(self, gate=1):
-        """Trigger ESP32-CAM chup anh"""
-        if gate == 1:
-            self.mqtt_gate1.trigger_camera()
-        else:
-            self.mqtt_gate2.trigger_camera()
+    def _save_image(self, frame, plate, direction, gate):
+        """Lưu ảnh xe local (legacy - không upload)"""
+        try:
+            dir_name = f"img_{direction}_gate{gate}"
+            img_dir = os.path.join(os.path.dirname(__file__), dir_name)
+            os.makedirs(img_dir, exist_ok=True)
+            filename = f"{plate}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(os.path.join(img_dir, filename), frame)
+            return os.path.join(img_dir, filename)
+        except:
+            return None
+    
+    def _upload_image_async(self, frame, ticket_code, image_type, gate):
+        """[ASYNC] Upload ảnh lên hosting - chạy background"""
+        try:
+            prefix = f"[G{gate}_{image_type.capitalize()}]"
+            result = self.img_uploader.capture_and_upload(frame, ticket_code, image_type)
+            if result.get('success'):
+                logger.info(f"{prefix} Upload OK: {result.get('size_kb', 0):.1f}KB")
+            else:
+                logger.warning(f"{prefix} Upload fail: {result.get('error', 'Unknown')}")
+            return result
+        except Exception as e:
+            logger.error(f"[G{gate}] Upload error: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def _sync_entry_data(self, plate, ticket_code, frame, gate, is_booking=False):
+        """[ASYNC] Gửi data xe VÀO lên hosting sau barrier close (với retry)"""
+        MAX_RETRIES = 3
+        prefix = f"[G{gate}_In]"
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Upload ảnh entry
+                img_result = self.img_uploader.capture_and_upload(frame, ticket_code, 'entry')
+                img_path = img_result.get('path', '') if img_result.get('success') else ''
+                
+                # Gọi API checkin (slot được tự động +1 bởi CAR_ENTERED event)
+                checkin_result = self.db.checkin(plate, 'SLOT', ticket_code)
+                
+                if checkin_result and checkin_result.get('success'):
+                    logger.info(f"{prefix} SYNC OK: {plate} | {ticket_code}")
+                    return  # Success, exit
+                else:
+                    error = checkin_result.get('error', 'Unknown') if checkin_result else 'No response'
+                    logger.warning(f"{prefix} SYNC API fail ({attempt+1}/{MAX_RETRIES}): {error}")
+                    
+            except Exception as e:
+                logger.error(f"{prefix} Sync error ({attempt+1}/{MAX_RETRIES}): {e}")
+            
+            # Wait before retry
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(1)
+        
+        logger.error(f"{prefix} SYNC FAILED after {MAX_RETRIES} retries")
+    
+    def _sync_exit_data(self, plate, ticket_code, frame, gate):
+        """[ASYNC] Gửi data xe RA lên hosting sau barrier close"""
+        try:
+            prefix = f"[G{gate}_Out]"
+            
+            # Upload ảnh exit
+            img_result = self.img_uploader.capture_and_upload(frame, ticket_code, 'exit')
+            img_path = img_result.get('path', '') if img_result.get('success') else ''
+            
+            # Checkout được gọi trong handle_exit rồi
+            logger.info(f"{prefix} SYNC OK: {plate} | {ticket_code}")
+                
+        except Exception as e:
+            logger.error(f"[G{gate}_Out] Sync error: {e}")
 
-    # === ENTRY GATE 1 ===
+    # === ENTRY GATE 1 (ESP32-CAM) ===
     def handle_entry(self):
-        """[GATE1] Flow xe vao"""
+        """[G1_In] Xử lý xe vào - Dùng ESP32-CAM"""
         if not self.gate1_entry_lock.acquire(blocking=False):
-            logger.warning("[GATE1] Entry busy, skip")
+            logger.warning("[G1_In] Đang xử lý xe khác")
             return
         try:
-            logger.info("="*50)
-            logger.info("🚗 XE VÀO - Bắt đầu xử lý")
-            logger.info("="*50)
-            self._display("in", "NHAN DIEN", "VUI LONG CHO")
+            logger.info("[G1_In] ========== XE VÀO ==========")
             
-            # 1. Chụp ảnh camera
-            logger.info("[GATE1] 📷 Chụp ảnh camera IN...")
-            frame = None
-            for attempt in range(3):
-                frame = self.gui.capture_frame('in', gate=1)
-                if frame is not None:
-                    logger.info("✅ Chụp ảnh thành công")
-                    break
-                logger.warning(f"⚠️ Chụp ảnh thất bại ({attempt + 1}/3)")
-                time.sleep(0.5)
+            # Chụp ảnh từ ESP32-CAM và nhận diện BSX
+            plate, frame = self._capture_plate_for_entry(gate=1)
             
-            if frame is None:
-                logger.error("❌ Camera vào lỗi")
-                self._entry_error("LOI CAMERA")
-                return
-            
-            # 2. Nhận diện BSX
-            logger.info("🔍 Đang nhận diện biển số...")
-            plate = self._recognize_plate(frame)
             if not plate:
-                logger.error("❌ Không nhận diện được BSX")
+                logger.error("[G1_In] Không nhận diện được BSX")
                 self._entry_error("KHONG NHAN DIEN")
                 return
             
-            logger.info(f"✅ BSX: {plate}")
+            logger.info(f"[G1_In] BSX: {plate}")
+            self._save_image(frame, plate, 'in', 1)
+            self._display("in", "DANG XU LY", plate)
             
-            # Lưu ảnh CHỈ KHI nhận diện thành công
-            try:
-                import os
-                from datetime import datetime
-                img_in_dir = os.path.join(os.path.dirname(__file__), 'img_in_gate1')
-                os.makedirs(img_in_dir, exist_ok=True)
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                filename = f"{plate}_{timestamp}.jpg"
-                cv2.imwrite(os.path.join(img_in_dir, filename), frame)
-                logger.info(f"[GATE1] 💾 Lưu ảnh IN: {filename}")
-            except Exception as e:
-                logger.warning(f"⚠️ Lưu ảnh IN lỗi: {e}")
-            
-            self.gui.update_plate_display('in', plate)
-            self._display("in", "DANG XU LY", "VUI LONG CHO...")
-            
-            # 3. Kiểm tra booking (OOP)
-            logger.info("🔍 Kiểm tra booking...")
+            # Kiểm tra booking
             booking_ticket = self.ticket_manager.get_booking_ticket(plate)
-            
-            # 4. Xử lý vé
             ticket = None
             ticket_code = None
             qr_url = ''
             is_booking = False
             
             if booking_ticket:
-                # Xe có booking đã thanh toán
                 ticket = booking_ticket
                 ticket_code = booking_ticket.ticket_code
                 qr_url = booking_ticket.qr_url
                 is_booking = True
-                logger.info(f"🎫 Xe booking: {plate} | Vé: {ticket_code}")
+                logger.info(f"[G1_In] Booking: {ticket_code}")
             else:
-                # Xe vãng lai - Kiểm tra slot trống
                 slots = self.db.get_available_slots()
                 if not slots:
-                    logger.warning(f"⛔ Bãi đầy")
-                    self._display("in", "BAI XE DAY", "VUI LONG QUAY LAI")
+                    logger.warning("[G1_In] Bãi đầy")
+                    self._display("in", "BAI XE DAY", "")
                     time.sleep(3)
                     self._display("in", "X-PARKING", "Entrance")
                     return
                 
-                # Tạo vé vãng lai mới
-                logger.info("🎫 Đang tạo vé ...")
                 ticket = self.ticket_manager.create_walk_in_ticket(plate)
                 if not ticket:
-                    logger.error("❌ Lỗi tạo vé")
+                    logger.error("[G1_In] Lỗi tạo vé")
                     self._entry_error("LOI TAO VE")
                     return
                 ticket_code = ticket.ticket_code
                 qr_url = ticket.qr_url
-                logger.info(f"✅ Vé vãng lai: {ticket_code}")
+                logger.info(f"[G1_In] Vé: {ticket_code}")
             
-            # Lấy available slots
             slots = self.db.get_available_slots()
             available_slots = slots if slots else ['A01']
-            logger.info(f"✅Slots_avaiable: {available_slots}")
             
-            # 5. Lưu pending entry - chờ slot sensor xác nhận (kèm frame để upload sau)
             self.config.pending_entry = {
-                'plate': plate,
-                'ticket': ticket,  # Lưu ticket object (OOP)
-                'ticket_code': ticket_code,
-                'available_slots': available_slots,
-                'is_booking': is_booking,
-                'qr_url': qr_url,
-                'frame': frame.copy(),  # Lưu frame để upload khi vào slot
-                'timestamp': time.time()
+                'plate': plate, 'ticket': ticket, 'ticket_code': ticket_code,
+                'available_slots': available_slots, 'is_booking': is_booking,
+                'qr_url': qr_url, 'frame': frame.copy(), 'timestamp': time.time()
             }
             
-            # 6. In vé (chỉ xe vãng lai) và mở barrier
             if is_booking:
-                # Xe booking đã có vé trên web → Không in, chỉ mở barrier
-                logger.info(f"🎫 Xe booking: {plate} | Vé: {ticket_code} | VÀO")
                 self._display("in", "MOI XE VAO", "DA XAC NHAN")
             else:
-                # Xe vãng lai → In vé mới
-                logger.info("🖨️ In vé...")
                 self._print_ticket(ticket_code, plate, qr_url)
                 self._display("in", "MOI XE VAO", ticket_code)
             
-            logger.info("🚧 Mở barrier...")
             self._barrier("in", "open")
-            
-            # 7. Gửi lệnh giám sát slots cho ESP32_GATE1
-            self._publish("xparking/gate1/command", json.dumps({
-                "event": "MONITOR_SLOTS",
-                "station": "IN",
-                "slots": available_slots
-            }))
-            
-            logger.info("⏳ Đợi xe vào slot...")
+            logger.info("[G1_In] Mở barrier")
             time.sleep(5)
             self._display("in", "X-PARKING", "Entrance")
             
         except Exception as e:
-            logger.error(f"❌ Entry error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[G1_In] Lỗi: {e}")
             self._entry_error("LOI HE THONG")
         finally:
             self.gate1_entry_lock.release()
-            logger.info("[GATE1] 🏁 Ket thuc xu ly xe vao\n")
+            logger.info("[G1_In] ========== XONG ==========\n")
+    
+    def _capture_plate_for_entry(self, gate=1):
+        """Chụp ảnh từ ESP32-CAM và nhận diện BSX cho ENTRY (3 lần retry)
+        Cơ chế: Python GET http://ESP32-IP/capture → nhận JPEG → LPR
+        """
+        MAX_RETRIES = 3
+        RETRY_DELAY = 1.0
+        prefix = f"[G{gate}_In]"
+        
+        # Lấy IP ESP32-CAM
+        if gate == 1:
+            esp32_ip = self.config.config['esp32_cam_gate1']
+        else:
+            esp32_ip = self.config.config['esp32_cam_gate2']
+        
+        capture_url = f"http://{esp32_ip}/capture"
+        
+        self._display("in", "NHAN DIEN BSX", "VUI LONG CHO", gate=gate)
+        logger.info(f"{prefix} Chụp ảnh từ ESP32-CAM ({esp32_ip})...")
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.info(f"{prefix} Capture ({attempt + 1}/{MAX_RETRIES}): {capture_url}")
+                
+                # GET ảnh từ ESP32-CAM HTTP Server
+                import numpy as np
+                response = requests.get(capture_url, timeout=10)
+                
+                if response.status_code != 200:
+                    logger.warning(f"{prefix} HTTP {response.status_code}")
+                    time.sleep(RETRY_DELAY)
+                    continue
+                
+                # Decode JPEG → OpenCV frame
+                nparr = np.frombuffer(response.content, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if frame is None:
+                    logger.warning(f"{prefix} Decode ảnh thất bại")
+                    time.sleep(RETRY_DELAY)
+                    continue
+                
+                size_kb = len(response.content) / 1024
+                logger.info(f"{prefix} Nhận ảnh: {size_kb:.1f}KB ({frame.shape[1]}x{frame.shape[0]})")
+                
+                # Nhận diện BSX
+                plate = self._recognize_plate(frame)
+                if plate:
+                    logger.info(f"{prefix} BSX: {plate}")
+                    return plate, frame
+                else:
+                    logger.warning(f"{prefix} Không nhận diện được BSX ({attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(RETRY_DELAY)
+                    
+            except requests.ConnectionError:
+                logger.error(f"{prefix} Không kết nối được ESP32-CAM ({esp32_ip})")
+                time.sleep(RETRY_DELAY)
+            except requests.Timeout:
+                logger.error(f"{prefix} Timeout ESP32-CAM")
+                time.sleep(RETRY_DELAY)
+            except Exception as e:
+                logger.error(f"{prefix} Lỗi: {e}")
+                time.sleep(RETRY_DELAY)
+        
+        logger.error(f"{prefix} THẤT BẠI sau {MAX_RETRIES} lần")
+        return None, None
 
     def _entry_error(self, msg):
         self._display("in", msg, "VUI LONG THU LAI")
@@ -314,54 +365,38 @@ class SystemFunctions:
         except Exception as e:
             logger.error(f"Print ticket error: {e}")
 
-    # === EXIT GATE 1 ===
+    # === EXIT GATE 1 (Webcam) ===
     def handle_exit(self):
-        """[GATE1] Flow xe ra voi xu ly song song"""
+        """[G1_Out] Xử lý xe ra - Dùng Webcam"""
         if not self.gate1_exit_lock.acquire(blocking=False):
-            logger.warning("[GATE1] Exit busy")
+            logger.warning("[G1_Out] Đang xử lý xe khác")
             return
         
-        EXIT_TIMEOUT = 60
         start_flow = time.time()
         plate = None
+        frame = None
         api_data = None
         qr_result = None
         
         try:
-            logger.info("="*50)
-            logger.info("🚀 XE RA - GATE 1")
-            logger.info("="*50)
-            self._display("out", "NHAN DIEN BSX", "VUI LONG CHO...")
+            logger.info("[G1_Out] ========== XE RA ==========")
             
-            # ========== BƯỚC 1: Chụp ảnh + Nhận diện BSX (ESP32-CAM) ==========
-            # Note: Exit sử dụng ESP32-CAM, không dùng webcam
-            frame = None
-            for attempt in range(3):
-                frame = self.gui.capture_frame('out', gate=1)
-                if frame is not None:
-                    break
-                time.sleep(0.3)
+            # ========== BƯỚC 1: Webcam chụp ảnh + Nhận diện BSX ==========
+            plate, frame = self._capture_plate_for_exit(gate=1)
             
-            if frame is None:
-                self._exit_error("LOI CAMERA")
-                return
-            
-            plate = self._recognize_plate(frame)
             if not plate:
+                logger.error("[G1_Out] Không nhận diện được BSX")
                 self._exit_error("KHONG NHAN DIEN BSX", "VUI LONG THU LAI")
                 return
             
-            logger.info(f"✅ BSX: {plate}")
-            self.gui.update_plate_display('out', plate)
-            self._display("out", "DA NHAN DIEN", "DANG XU LY...")
-            
-            # Lưu ảnh (async)
+            logger.info(f"[G1_Out] BSX: {plate}")
+            self._display("out", "DA NHAN DIEN", plate)
             self.executor.submit(self._save_exit_image, frame, plate)
+            time.sleep(1.5)
             
-            # ========== BƯỚC 2: Kiểm tra cache + SONG SONG ==========
+            # Kiểm tra cache + xử lý song song
             api_data = ExitCacheManager.get(plate, gate=1)
-            
-            logger.info("⚡ Bắt đầu xử lý SONG SONG...")
+            logger.info("[G1_Out] Xử lý song song (API + QR)...")
             
             # Chuẩn bị QR scan
             self.config.waiting_for_qr = True
@@ -371,18 +406,13 @@ class SystemFunctions:
             # Tạo futures cho parallel execution
             futures = {}
             
-            # Task 1: API call - CHỈ gọi nếu KHÔNG có cache
             if not api_data:
-                futures['api'] = self.executor.submit(self._fetch_exit_data, plate)
-                logger.info("📡 API: Đang lấy data...")
+                futures['api'] = self.executor.submit(self._fetch_exit_data, plate, 1)
+                logger.info("[G1_Out] Gọi API...")
             else:
-                logger.info(f"📦 Cache HIT: {plate} → Skip API call")
+                logger.info(f"[G1_Out] Cache: {plate}")
             
-            # Task 2: QR scan - LUÔN scan để verify
-            futures['qr'] = self.executor.submit(self._scan_qr_parallel)
-            
-            # Hiện thông báo scan
-            self._display("out", "SCAN VE", "DUA VE VAO CAM")
+            futures['qr'] = self.executor.submit(self._scan_qr_parallel, 1)
             
             # Chờ cả 2 task hoàn thành (timeout 30s)
             PARALLEL_TIMEOUT = 30
@@ -405,18 +435,15 @@ class SystemFunctions:
             
             self.config.waiting_for_qr = False
             
-            # ========== BƯỚC 3: Kiểm tra kết quả ==========
-            
-            # 3.1 Kiểm tra API data
             if api_data is None:
-                logger.error("❌ Không lấy được data từ API")
+                logger.error("[G1_Out] API thất bại")
                 self._exit_error("LOI KET NOI", "THU LAI SAU")
                 return
             
             if not api_data.get('found', False):
                 error = api_data.get('error', 'UNKNOWN')
-                logger.error(f"❌ BSX không tồn tại: {error}")
-                ExitCacheManager.clear(gate=1)  # Clear cache lỗi
+                logger.error(f"[G1_Out] Xe không có: {error}")
+                ExitCacheManager.clear(gate=1)
                 
                 if error == 'BSX_NOT_IN_PARKING':
                     self._exit_error("XE KHONG CO", "TRONG HE THONG")
@@ -425,46 +452,42 @@ class SystemFunctions:
                 return
             
             expected_ticket = api_data.get('ticket_code', '')
-            logger.info(f"📦 API Data: Vé={expected_ticket}, Status={api_data.get('status')}")
+            status = api_data.get('status', '')
+            logger.info(f"[G1_Out] Vé: {expected_ticket} | Status: {status}")
             
-            # 3.2 Kiểm tra QR
             if not qr_result:
-                logger.error("❌ Không đọc được QR")
-                # KHÔNG clear cache - để retry dùng lại
+                logger.error("[G1_Out] Không đọc được QR")
                 self._exit_error("KHONG DOC DUOC QR", "VUI LONG THU LAI")
                 return
             
-            logger.info(f"🎫 QR: {qr_result}")
+            logger.info(f"[G1_Out] QR: {qr_result}")
             
-            # 3.3 So sánh mã vé
             if qr_result != expected_ticket:
-                logger.warning(f"❌ Vé không khớp: QR={qr_result} vs DB={expected_ticket}")
-                # KHÔNG clear cache - để retry
+                logger.warning(f"[G1_Out] Vé không khớp: {qr_result} vs {expected_ticket}")
                 self._exit_error("VE KHONG KHOP", "VUI LONG THU LAI")
                 return
             
-            logger.info("✅ Vé KHỚP!")
+            logger.info("[G1_Out] Xác thực OK")
             
             # ========== BƯỚC 4: Kiểm tra thanh toán ==========
             status = api_data.get('status', '')
             
             if status == 'USED':
-                logger.warning("⚠️ Vé đã sử dụng")
+                logger.warning("[G1_Out] Vé đã dùng")
                 ExitCacheManager.clear(gate=1)
                 self._exit_error("VE DA SU DUNG", "VUI LONG THU LAI")
                 return
             
             if status == 'PENDING':
                 amount = api_data.get('amount', 0)
-                logger.warning(f"⚠️ Chưa thanh toán: {amount:,}đ")
+                logger.warning(f"[G1_Out] Chưa thanh toán: {amount:,}đ")
                 self._exit_error("CHUA THANH TOAN", f"{amount:,}d" if amount else "")
                 return
             
-            # Kiểm tra overstay
             if api_data.get('has_overstay', False) and api_data.get('overstay_amount', 0) > 0:
                 overstay_fee = api_data.get('overstay_amount', 0)
                 overstay_mins = api_data.get('overstay_minutes', 0)
-                logger.warning(f"⚠️ Quá giờ {overstay_mins}p - Phí: {overstay_fee:,}đ")
+                logger.warning(f"[G1_Out] Quá giờ {overstay_mins}p - {overstay_fee:,}đ")
                 self._display("out", f"QUA GIO {overstay_mins}P", f"PHI: {overstay_fee:,}d")
                 time.sleep(2)
                 self._display("out", "QUET QR", "DE THANH TOAN")
@@ -472,35 +495,31 @@ class SystemFunctions:
                 self._display("out", "X-PARKING", "Exit")
                 return
             
-            # Kiểm tra allow_exit
             if not api_data.get('allow_exit', False):
                 error_reason = api_data.get('error_reason', 'UNKNOWN')
-                logger.error(f"❌ Không cho ra: {error_reason}")
+                logger.error(f"[G1_Out] Không cho ra: {error_reason}")
                 self._exit_error("KHONG THE RA", "VUI LONG THU LAI")
                 return
             
-            # ========== BƯỚC 5: CHECKOUT (Song song: DB + Clear cache) ==========
-            logger.info("🔓 Đang checkout...")
+            # Checkout + Lưu pending exit để sync sau barrier close
+            self.executor.submit(self.db.checkout, expected_ticket, plate)
+            self.executor.submit(ExitCacheManager.clear, 1)
             
-            # Song song: checkout API + clear cache
-            checkout_future = self.executor.submit(self.db.checkout, expected_ticket, plate)
-            clear_future = self.executor.submit(ExitCacheManager.clear, 1)
+            # Lưu pending exit để upload ảnh sau barrier close
+            self.config.pending_exit = {
+                'plate': plate, 'ticket_code': expected_ticket,
+                'frame': frame.copy() if frame is not None else None,
+                'timestamp': time.time()
+            }
             
-            # Không chờ kết quả checkout - mở barrier trước
             paid = api_data.get('amount', 0)
-            logger.info("="*50)
-            logger.info(f"✅ CHECKOUT THÀNH CÔNG!")
-            logger.info(f"   BSX: {plate} | Vé: {expected_ticket} | Phí: {paid:,}đ")
-            logger.info("="*50)
+            logger.info(f"[G1_Out] CHECKOUT OK | {plate} | {expected_ticket} | {paid:,}đ")
             
-            # ========== BƯỚC 6: Mở barrier ==========
             self._display("out", "TAM BIET", "HEN GAP LAI")
             self._barrier("out", "open")
             
         except Exception as e:
-            logger.error(f"❌ Exit error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[G1_Out] Lỗi: {e}")
             self._exit_error("LOI HE THONG", "VUI LONG THU LAI")
         finally:
             self.config.waiting_for_qr = False
@@ -508,135 +527,149 @@ class SystemFunctions:
             self.config.qr_scan_result = None
             self.gate1_exit_lock.release()
             elapsed = time.time() - start_flow
-            logger.info(f"[GATE1] 🏁 Ket thuc xu ly xe ra ({elapsed:.1f}s)\n")
+            logger.info(f"[G1_Out] ========== XONG ({elapsed:.1f}s) ==========\n")
     
-    def _fetch_exit_data(self, plate):
-        """[PARALLEL] Gọi API lấy toàn bộ data xe ra"""
+    def _fetch_exit_data(self, plate, gate=1):
+        """[PARALLEL] Gọi API lấy data xe ra - HỖ TRỢ CẢ 2 GATE"""
+        prefix = f"[G{gate}_Out]"
         try:
-            logger.info(f"📡 API: Đang lấy data cho {plate}...")
+            logger.info(f"{prefix} API: Lấy data {plate}...")
             data = self.db.verify_exit_full(plate)
             
             if data and data.get('found', False):
-                # Lưu vào cache
-                ExitCacheManager.set(plate, data, gate=1)
+                ExitCacheManager.set(plate, data, gate=gate)
             
             return data
         except Exception as e:
-            logger.error(f"API error: {e}")
+            logger.error(f"{prefix} API error: {e}")
             return None
     
-    def _scan_qr_parallel(self):
-        """[PARALLEL] Scan QR qua MQTT"""
-        SCAN_TIMEOUT = 25
-        scan_start = time.time()
+    def _capture_plate_for_exit(self, gate=1):
+        """Chụp ảnh từ Webcam và nhận diện BSX cho EXIT (3 lần retry)"""
+        MAX_RETRIES = 3
+        prefix = f"[G{gate}_Out]"
         
-        for attempt in range(5):
-            if time.time() - scan_start > SCAN_TIMEOUT:
-                break
-            
-            if not self.config.waiting_for_qr:
-                break
-            
-            self.config.qr_scan_result = None
-            
-            # Trigger ESP32-CAM qua MQTT
-            self._trigger_camera(gate=1)
-            
-            # Cho MQTT response (toi da 5s)
-            wait_start = time.time()
-            while time.time() - wait_start < 5:
-                if self.config.qr_scan_result:
-                    return self.config.qr_scan_result
-                time.sleep(0.1)
-            
-            if attempt < 4:
-                logger.info(f"📸 Retry QR ({attempt + 2}/5)")
-                self._display("out", "SCAN LAI", f"LAN {attempt + 2}/5")
-                time.sleep(0.2)
+        self._display("out", "NHAN DIEN BSX", "VUI LONG CHO", gate=gate)
+        logger.info(f"{prefix} Nhận diện BSX từ Webcam...")
         
+        for attempt in range(MAX_RETRIES):
+            frame = self.camera.capture_frame('out', gate=gate)
+            
+            if frame is None:
+                logger.warning(f"{prefix} Không nhận được ảnh ({attempt + 1}/{MAX_RETRIES})")
+                time.sleep(0.3)
+                continue
+            
+            plate = self._recognize_plate(frame)
+            if plate:
+                logger.info(f"{prefix} BSX: {plate}")
+                return plate, frame
+            else:
+                logger.warning(f"{prefix} Không nhận diện được BSX ({attempt + 1}/{MAX_RETRIES})")
+                time.sleep(0.5)
+        
+        logger.error(f"{prefix} THẤT BẠI sau {MAX_RETRIES} lần")
+        return None, None
+    
+    def _scan_qr_parallel(self, gate=1):
+        """[PARALLEL] Scan QR từ Webcam - HỖ TRỢ CẢ 2 GATE"""
+        MAX_RETRIES = 3
+        RETRY_DELAY = 2.5
+        prefix = f"[G{gate}_Out]"
+        
+        logger.info(f"{prefix} Scan QR từ Webcam...")
+        
+        for attempt in range(MAX_RETRIES):
+            # Kiểm tra biến riêng cho mỗi gate
+            if gate == 1:
+                if not self.config.waiting_for_qr:
+                    break
+            else:
+                if not self.config.waiting_for_qr_gate2:
+                    break
+            
+            # Hiển thị SCAN VE trong thời gian chờ delay 2.5s
+            self._display("out", "SCAN VE", "DUA VE VAO", gate=gate)
+            time.sleep(RETRY_DELAY)
+            
+            # Sau delay, chụp ảnh từ Webcam và scan QR
+            self._display("out", "NHAN DIEN VE", "VUI LONG CHO", gate=gate)
+            logger.info(f"{prefix} QR ({attempt + 1}/{MAX_RETRIES})")
+            
+            # Chụp từ Webcam (camera_type='out')
+            frame = self.camera.capture_frame('out', gate=gate)
+            if frame is None:
+                logger.warning(f"{prefix} Không nhận được ảnh từ Webcam")
+                continue
+            
+            # Scan QR từ frame
+            ticket_code = self._scan_qr_from_webcam_frame(frame, gate)
+            if ticket_code:
+                logger.info(f"{prefix} QR: {ticket_code}")
+                # Lưu kết quả
+                if gate == 1:
+                    self.config.qr_scan_result = ticket_code
+                else:
+                    self.config.qr_scan_result_gate2 = ticket_code
+                return ticket_code
+            
+            logger.warning(f"{prefix} QR không nhận diện được")
+        
+        logger.error(f"{prefix} QR thất bại sau {MAX_RETRIES} lần")
         return None
     
-    def _process_qr_from_bytes(self, jpeg_bytes):
-        """Xu ly QR tu anh JPEG binary"""
-        if not self.config.waiting_for_qr:
-            return
-        
+    def _scan_qr_from_webcam_frame(self, frame, gate=1):
+        """Scan QR từ frame Webcam và trả về ticket_code"""
         try:
-            from qr_scanner import scan_qr_from_bytes, extract_ticket_code
-            import cv2
-            import numpy as np
-            from datetime import datetime
-            import os
+            from qr_scanner import scan_qr_from_frame, extract_ticket_code
             
-            # Decode JPEG
-            nparr = np.frombuffer(jpeg_bytes, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if frame is None:
-                logger.warning("Decode anh loi")
-                return
+            # Scan QR từ frame gốc
+            qr_content = scan_qr_from_frame(frame)
             
-            # Scan QR
-            qr_content = scan_qr_from_bytes(jpeg_bytes)
-            
-            # Thu grayscale neu khong duoc
+            # Thử grayscale nếu không được
             if not qr_content:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                from qr_scanner import scan_qr_from_frame
                 qr_content = scan_qr_from_frame(gray)
             
             if not qr_content:
-                logger.warning("⚠️ QR khong nhan dien duoc")
-                return
+                return None
             
             ticket_code = extract_ticket_code(qr_content)
             if ticket_code:
-                logger.info(f"✅ QR: {ticket_code}")
-                self.config.qr_scan_result = ticket_code
-                
-                # Luu anh ve
+                # Lưu ảnh vé
                 try:
-                    tickets_dir = os.path.join(os.path.dirname(__file__), 'tickets_out_gate1')
+                    tickets_dir = os.path.join(os.path.dirname(__file__), f'tickets_out_gate{gate}')
                     os.makedirs(tickets_dir, exist_ok=True)
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     filename = f"{ticket_code}_{timestamp}.jpg"
                     cv2.imwrite(os.path.join(tickets_dir, filename), frame)
-                    logger.info(f"💾 Luu anh ve: {filename}")
+                    logger.info(f"[G{gate}] Lưu ảnh vé: {filename}")
                 except Exception as e:
-                    logger.warning(f"Luu anh loi: {e}")
-            else:
-                logger.warning("QR khong hop le")
-                
+                    logger.warning(f"[G{gate}] Lưu ảnh vé lỗi: {e}")
+                return ticket_code
+            
+            return None
         except Exception as e:
-            logger.error(f"Xu ly QR loi: {e}")
+            logger.error(f"[G{gate}] Scan QR lỗi: {e}")
+            return None
     
-    def _save_exit_image(self, frame, plate):
-        """[ASYNC] Lưu ảnh xe ra"""
+    def _save_exit_image(self, frame, plate, gate=1):
+        """[ASYNC] Lưu ảnh xe ra - dùng chung cho cả 2 gate"""
         try:
-            img_out_dir = os.path.join(os.path.dirname(__file__), 'img_out_gate1')
+            img_out_dir = os.path.join(os.path.dirname(__file__), f'img_out_gate{gate}')
             os.makedirs(img_out_dir, exist_ok=True)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"{plate}_{timestamp}.jpg"
             cv2.imwrite(os.path.join(img_out_dir, filename), frame)
-            logger.info(f"[GATE1] 💾 Lưu ảnh OUT: {filename}")
+            logger.info(f"[G{gate}_Out] Lưu ảnh: {filename}")
         except Exception as e:
-            logger.warning(f"⚠️ Lưu ảnh OUT lỗi: {e}")
-    
-    def _upload_exit_image_safe(self, frame, ticket_code):
-        """Upload ảnh xe ra với try-catch"""
-        try:
-            result = self.img_uploader.capture_and_upload(frame, ticket_code, 'exit')
-            if result.get('success'):
-                logger.info(f"✅ Upload ảnh OK ({result.get('size_kb')}KB)")
-            else:
-                logger.warning(f"⚠️ Upload ảnh thất bại: {result.get('error')}")
-        except Exception as e:
-            logger.warning(f"⚠️ Upload ảnh lỗi: {e}")
+            logger.warning(f"[G{gate}_Out] Lưu ảnh lỗi: {e}")
 
     def _exit_error(self, line1, line2="VUI LONG THU LAI"):
         self._display("out", line1, line2)
         time.sleep(3)
         self._display("out", "X-PARKING", "Exit")
-
+    
     # === HELPERS ===
     def _recognize_plate(self, frame):
         """Nhận diện biển số - trả về plate string hoặc None"""
@@ -666,9 +699,9 @@ class SystemFunctions:
         try:
             result = self.img_uploader.capture_and_upload(frame, ticket_code, 'entry')
             if result.get('success'):
-                logger.info(f"📷 Entry image uploaded: {result.get('size_kb')}KB")
+                logger.info(f" Entry image uploaded: {result.get('size_kb')}KB")
             else:
-                logger.warning(f"❌ Entry image upload failed: {result.get('error')}")
+                logger.warning(f" Entry image upload failed: {result.get('error')}")
         except Exception as e:
             logger.error(f"Entry image upload error: {e}")
     
@@ -677,9 +710,9 @@ class SystemFunctions:
         try:
             result = self.img_uploader.capture_and_upload(frame, ticket_code, 'exit')
             if result.get('success'):
-                logger.info(f"📷 Exit image uploaded: {result.get('size_kb')}KB")
+                logger.info(f" Exit image uploaded: {result.get('size_kb')}KB")
             else:
-                logger.warning(f"❌ Exit image upload failed: {result.get('error')}")
+                logger.warning(f" Exit image upload failed: {result.get('error')}")
         except Exception as e:
             logger.error(f"Exit image upload error: {e}")
     
@@ -688,9 +721,9 @@ class SystemFunctions:
         try:
             result = self.img_uploader.capture_and_upload(frame, ticket_code, 'ticket')
             if result.get('success'):
-                logger.info(f"📷 Ticket image uploaded: {result.get('size_kb')}KB")
+                logger.info(f" Ticket image uploaded: {result.get('size_kb')}KB")
             else:
-                logger.warning(f"❌ Ticket image upload failed: {result.get('error')}")
+                logger.warning(f" Ticket image upload failed: {result.get('error')}")
         except Exception as e:
             logger.error(f"Ticket image upload error: {e}")
 
@@ -706,7 +739,7 @@ class SystemFunctions:
                     return
                 
                 # Cập nhật GUI
-                self.gui.update_slot_status(slot_id, 'occupied')
+                self.camera.update_slot_status(slot_id, 'occupied')
                 
                 # === COMMIT PENDING ENTRY ===
                 pending = getattr(self.config, 'pending_entry', None)
@@ -717,28 +750,28 @@ class SystemFunctions:
                     ticket = pending.get('ticket')
                     entry_frame = pending.get('frame')
                     
-                    logger.info(f"🅿️ Xe vào slot {slot_id}")
+                    logger.info(f"🅿 Xe vào slot {slot_id}")
                     
                     # Upload ảnh xe vào trước - TẠM COMMENT
                     # if entry_frame is not None:
-                    #     logger.info("📤 Upload ảnh xe vào...")
+                    #     logger.info(" Upload ảnh xe vào...")
                     #     upload_result = self.img_uploader.capture_and_upload(entry_frame, ticket_code, 'entry')
                     #     if upload_result.get('success'):
-                    #         logger.info(f"✅ Upload ảnh OK ({upload_result.get('size_kb')}KB)")
+                    #         logger.info(f" Upload ảnh OK ({upload_result.get('size_kb')}KB)")
                     #     else:
-                    #         logger.warning(f"⚠️ Upload ảnh thất bại: {upload_result.get('error')}")
+                    #         logger.warning(f" Upload ảnh thất bại: {upload_result.get('error')}")
                     
                     # Commit vào DB
-                    logger.info("💾 Lưu dữ liệu vào DB...")
+                    logger.info(" Lưu dữ liệu vào DB...")
                     self.db.checkin(plate, slot_id, ticket_code)
                     
                     # Update booking nếu có
                     if is_booking and ticket and hasattr(ticket, 'booking_id') and ticket.booking_id:
-                        logger.info(f"📝 Update booking status: in_parking")
+                        logger.info(f" Update booking status: in_parking")
                         self.db.update_booking(ticket.booking_id, 'in_parking')
                     
                     logger.info("="*50)
-                    logger.info(f"✅ XE VÀO THÀNH CÔNG!")
+                    logger.info(f" XE VÀO THÀNH CÔNG!")
                     logger.info(f"   BSX: {plate} | Slot: {slot_id} | Vé: {ticket_code}")
                     if is_booking:
                         logger.info(f"   Loại: BOOKING")
@@ -747,25 +780,19 @@ class SystemFunctions:
                     # Clear pending
                     self.config.pending_entry = None
                 else:
-                    logger.info(f"🅿️ Slot {slot_id}: Có xe")
+                    logger.info(f"🅿 Slot {slot_id}: Có xe")
                     
             elif event == 'MONITOR_TIMEOUT':
                 # Xe không vào slot - rollback
                 pending = getattr(self.config, 'pending_entry', None)
                 if pending:
-                    logger.warning(f"⚠️ TIMEOUT: {pending['plate']} không vào slot - Hủy vé {pending['ticket_code']}")
-                    # TODO: Có thể gọi API hủy vé ở đây
+                    logger.warning(f" TIMEOUT: {pending['plate']} không vào slot")
                     self.config.pending_entry = None
-                    
-            elif 'slot_status' in data:
-                for slot in data['slot_status']:
-                    slot_id = slot.get('id')
-                    occupied = slot.get('occupied', False)
-                    if slot_id:
-                        self.gui.update_slot_status(slot_id, 'occupied' if occupied else 'empty')
                         
         except Exception as e:
             logger.error(f"Slot error: {e}")
+        
+        # Slot status từ ESP32 không dùng nữa - dùng global count từ DB
 
     def _handle_alert(self, payload):
         """Xử lý cảnh báo từ ESP32_IN
@@ -781,149 +808,207 @@ class SystemFunctions:
                 self._barrier("out", "open")
                 self._display("in", "KHAN CAP", "DI CHAN NGAY")
                 self._display("out", "KHAN CAP", "DI CHAN NGAY")
-                self.gui.update_emergency_status()
                 if not self.config.gas_alert_sent:
                     gas_value = int(data.get('data', 0))
                     self.email.send_alert_email(gas_value, "Bãi đỗ xe XParking")
                     self.config.gas_alert_sent = True
-                logger.warning(f"🚨 EMERGENCY: Smoke detected! Value: {data.get('data')}")
+                logger.warning(f" EMERGENCY: Smoke detected! Value: {data.get('data')}")
                     
             elif event == 'EMERGENCY_CLEAR':
                 self.config.emergency_mode = False
                 self.config.gas_alert_sent = False
-                self.gui.update_emergency_status()
                 self._display("in", "X-PARKING", "Entrance")
                 self._display("out", "X-PARKING", "Exit")
-                logger.info("✅ Emergency cleared")
+                logger.info(" Emergency cleared")
         except Exception as e:
             logger.error(f"Alert handling error: {e}")
 
-    # === ENTRY GATE 2 ===
+    # === SLOT MANAGEMENT (SIMPLIFIED) ===
+    def _on_car_entered(self, gate=1):
+        """Xe đã vào bãi (barrier closed) → +1 slot, sync data + ảnh"""
+        try:
+            prefix = f"[G{gate}_In]"
+            
+            # 1. Increment slot count
+            slot_result = self.db.increment_slot()
+            if slot_result and slot_result.get('success'):
+                count = self.db.get_slot_count()
+                logger.info(f"{prefix} SLOT +1 → {count['occupied']}/{count['total']}")
+            
+            # 2. Sync data + ảnh lên hosting (từ pending_entry)
+            pending_attr = 'pending_entry' if gate == 1 else 'pending_entry_gate2'
+            pending = getattr(self.config, pending_attr, None)
+            if pending and pending.get('frame') is not None:
+                plate = pending.get('plate', '')
+                ticket_code = pending.get('ticket_code', '')
+                frame = pending.get('frame')
+                is_booking = pending.get('is_booking', False)
+                
+                # Upload ảnh + checkin (async trong thread hiện tại)
+                self._sync_entry_data(plate, ticket_code, frame, gate, is_booking)
+                
+                # Clear pending
+                setattr(self.config, pending_attr, None)
+                
+        except Exception as e:
+            logger.error(f"[G{gate}_In] _on_car_entered error: {e}")
+    
+    def _on_car_exited(self, gate=1):
+        """Xe đã ra bãi (barrier closed) → -1 slot, sync data + ảnh"""
+        try:
+            prefix = f"[G{gate}_Out]"
+            
+            # 1. Decrement slot count
+            slot_result = self.db.decrement_slot()
+            if slot_result and slot_result.get('success'):
+                count = self.db.get_slot_count()
+                logger.info(f"{prefix} SLOT -1 → {count['occupied']}/{count['total']}")
+            
+            # 2. Upload ảnh exit (từ pending_exit)
+            pending_attr = 'pending_exit' if gate == 1 else 'pending_exit_gate2'
+            pending = getattr(self.config, pending_attr, None)
+            if pending and pending.get('frame') is not None:
+                plate = pending.get('plate', '')
+                ticket_code = pending.get('ticket_code', '')
+                frame = pending.get('frame')
+                
+                # Upload ảnh exit
+                self._sync_exit_data(plate, ticket_code, frame, gate)
+                
+                # Clear pending
+                setattr(self.config, pending_attr, None)
+                
+        except Exception as e:
+            logger.error(f"[G{gate}_Out] _on_car_exited error: {e}")
+
+    # === ENTRY GATE 2 (ESP32-CAM) ===
     def handle_entry_gate2(self):
-        """[GATE2] Flow xe vao"""
+        """[G2_In] Xử lý xe vào - Dùng ESP32-CAM"""
         if not self.gate2_entry_lock.acquire(blocking=False):
-            logger.warning("[GATE2] Entry busy")
+            logger.warning("[G2_In] Đang xử lý xe khác - bỏ qua")
             return
         try:
-            logger.info("="*50)
-            logger.info("[GATE2] 🚗 XE VAO")
-            logger.info("="*50)
-            self._display("in", "NHAN DIEN", "VUI LONG CHO", gate=2)
+            logger.info("[G2_In] ========== XE VÀO ==========")
             
-            # Capture frame
-            logger.info("[GATE2] 📷 Chup anh camera IN...")
-            frame = None
-            for attempt in range(3):
-                frame = self.gui.capture_frame('in', gate=2)
-                if frame is not None:
-                    break
-                time.sleep(0.3)
+            # Chụp ảnh từ ESP32-CAM và nhận diện BSX
+            plate, frame = self._capture_plate_for_entry(gate=2)
             
-            if frame is None:
-                self._display("in", "LOI CAMERA", "VUI LONG THU LAI", gate=2)
-                return
-            
-            # Recognize plate
-            plate = self._recognize_plate(frame)
             if not plate:
-                self._display("in", "KHONG NHAN DIEN BSX", "VUI LONG THU LAI", gate=2)
+                logger.error("[G2_In] Không nhận diện được BSX")
+                self._display("in", "KHONG NHAN DIEN", "VUI LONG THU LAI", gate=2)
+                time.sleep(3)
+                self._display("in", "X-PARKING", "Entrance", gate=2)
                 return
             
-            logger.info(f"[GATE2] ✅ BSX: {plate}")
-            self.gui.update_plate_display('in', plate)
-            self._display("in", "DA NHAN DIEN", "DANG XU LY...", gate=2)
+            logger.info(f"[G2_In] BSX: {plate}")
+            self._save_image(frame, plate, 'in', 2)
+            self._display("in", "DANG XU LY", plate, gate=2)
             
-            # Get ticket
-            ticket = self.ticket_manager.get_booking_ticket(plate)
-            if not ticket:
-                ticket = self.ticket_manager.create_walkin_ticket(plate)
+            # Kiểm tra booking
+            booking_ticket = self.ticket_manager.get_booking_ticket(plate)
+            ticket = None
+            ticket_code = None
+            qr_url = ''
+            is_booking = False
             
-            if not ticket:
-                self._display("in", "BAI DAY", "VUI LONG THU LAI", gate=2)
-                return
+            if booking_ticket:
+                ticket = booking_ticket
+                ticket_code = booking_ticket.ticket_code
+                qr_url = booking_ticket.qr_url
+                is_booking = True
+                logger.info(f"[G2_In] Booking: {ticket_code}")
+            else:
+                slots = self.db.get_available_slots()
+                if not slots:
+                    logger.warning("[G2_In] Bãi đầy")
+                    self._display("in", "BAI XE DAY", "", gate=2)
+                    time.sleep(3)
+                    self._display("in", "X-PARKING", "Entrance", gate=2)
+                    return
+                
+                ticket = self.ticket_manager.create_walk_in_ticket(plate)
+                if not ticket:
+                    logger.error("[G2_In] Lỗi tạo vé")
+                    self._display("in", "LOI TAO VE", "VUI LONG THU LAI", gate=2)
+                    time.sleep(3)
+                    self._display("in", "X-PARKING", "Entrance", gate=2)
+                    return
+                ticket_code = ticket.ticket_code
+                qr_url = ticket.qr_url
+                logger.info(f"[G2_In] Vé: {ticket_code}")
             
-            logger.info(f"[GATE2] 🎫 Ve: {ticket.ticket_code}")
+            # Lưu pending entry cho Gate 2
+            self.config.pending_entry_gate2 = {
+                'plate': plate, 'ticket': ticket, 'ticket_code': ticket_code,
+                'is_booking': is_booking, 'qr_url': qr_url, 
+                'frame': frame.copy(), 'timestamp': time.time()
+            }
             
-            # Open barrier
+            if is_booking:
+                self._display("in", "MOI XE VAO", "DA XAC NHAN", gate=2)
+            else:
+                self._print_ticket(ticket_code, plate, qr_url)
+                self._display("in", "MOI XE VAO", ticket_code, gate=2)
+            
             self._barrier("in", "open", gate=2)
-            self._display("in", "MOI VAO", "CHUC BAN AN TOAN", gate=2)
-            
-            # Wait for slot
+            logger.info("[G2_In] Mở barrier")
             time.sleep(5)
-            self._display("in", "X-PARKING", "GATE 2 IN", gate=2)
+            self._display("in", "X-PARKING", "Entrance", gate=2)
             
         except Exception as e:
-            logger.error(f"[GATE2] Entry error: {e}")
+            logger.error(f"[G2_In] Lỗi: {e}")
             self._display("in", "LOI HE THONG", "VUI LONG THU LAI", gate=2)
         finally:
             self.gate2_entry_lock.release()
-            logger.info("[GATE2] 🏁 Ket thuc xu ly xe vao\n")
+            logger.info("[G2_In] ========== XONG ==========\n")
     
-    # === EXIT GATE 2 ===
+    # === EXIT GATE 2 (Webcam) ===
     def handle_exit_gate2(self):
-        """[GATE2] Flow xe ra voi xu ly song song"""
+        """[G2_Out] Xử lý xe ra - Dùng Webcam"""
         if not self.gate2_exit_lock.acquire(blocking=False):
-            logger.warning("[GATE2] Exit busy, skip")
+            logger.warning("[G2_Out] Đang xử lý xe khác - bỏ qua")
             return
         
         start_flow = time.time()
         plate = None
+        frame = None
         api_data = None
         qr_result = None
         
         try:
-            logger.info("="*50)
-            logger.info("[GATE2] 🚀 XE RA")
-            logger.info("="*50)
-            self._display("out", "NHAN DIEN BSX", "VUI LONG CHO...", gate=2)
+            logger.info("[G2_Out] ========== XE RA ==========")
             
-            # Capture frame (ESP32-CAM)
-            frame = None
-            for attempt in range(3):
-                frame = self.gui.capture_frame('out', gate=2)
-                if frame is not None:
-                    break
-                time.sleep(0.3)
+            # Webcam chụp ảnh + Nhận diện BSX
+            plate, frame = self._capture_plate_for_exit(gate=2)
             
-            if frame is None:
-                self._display("out", "LOI CAMERA", "VUI LONG THU LAI", gate=2)
-                return
-            
-            # Recognize plate
-            plate = self._recognize_plate(frame)
             if not plate:
-                self._display("out", "KHONG NHAN DIEN", "VUI LONG THU LAI", gate=2)
+                logger.error("[G2_Out] Không nhận diện được BSX")
+                self._exit_error_gate2("KHONG NHAN DIEN BSX", "VUI LONG THU LAI")
                 return
             
-            logger.info(f"[GATE2] ✅ BSX: {plate}")
-            self.gui.update_plate_display('out', plate)
-            self._display("out", "DA NHAN DIEN", "DANG XU LY...", gate=2)
+            logger.info(f"[G2_Out] BSX: {plate}")
+            self._display("out", "DA NHAN DIEN", plate, gate=2)
+            self.executor.submit(self._save_exit_image, frame, plate, 2)
+            time.sleep(1.5)
             
-            # Check cache
+            # Kiểm tra cache + xử lý song song
             api_data = ExitCacheManager.get(plate, gate=2)
+            logger.info("[G2_Out] Xử lý song song (API + QR)...")
             
-            logger.info("[GATE2] ⚡ Bat dau xu ly SONG SONG...")
-            
-            # Setup QR scan
             self.config.waiting_for_qr_gate2 = True
             self.config.current_exit_plate_gate2 = plate
             self.config.qr_scan_result_gate2 = None
             
             futures = {}
             
-            # API call if no cache
             if not api_data:
-                futures['api'] = self.executor.submit(self._fetch_exit_data, plate)
-                logger.info("[GATE2] 📡 API: Dang lay data...")
+                futures['api'] = self.executor.submit(self._fetch_exit_data, plate, 2)
+                logger.info("[G2_Out] Gọi API...")
             else:
-                logger.info(f"[GATE2] 📦 Cache HIT: {plate} → Skip API")
+                logger.info(f"[G2_Out] Cache: {plate}")
             
-            # QR scan
-            futures['qr'] = self.executor.submit(self._scan_qr_parallel_gate2)
+            futures['qr'] = self.executor.submit(self._scan_qr_parallel, 2)
             
-            self._display("out", "SCAN VE", "DUA VE VAO CAM", gate=2)
-            
-            # Wait for both tasks
             PARALLEL_TIMEOUT = 30
             wait_start = time.time()
             
@@ -941,131 +1026,84 @@ class SystemFunctions:
             
             self.config.waiting_for_qr_gate2 = False
             
-            # Verify data
-            if not api_data or not api_data.get('found'):
-                logger.error("[GATE2] Khong lay duoc data")
-                self._display("out", "LOI DU LIEU", "VUI LONG THU LAI", gate=2)
+            if api_data is None:
+                logger.error("[G2_Out] API thất bại")
+                self._exit_error_gate2("LOI KET NOI", "THU LAI SAU")
                 return
             
-            if not qr_result:
-                logger.error("[GATE2] Khong doc duoc QR")
-                self._display("out", "KHONG DOC DUOC QR", "VUI LONG THU LAI", gate=2)
+            if not api_data.get('found', False):
+                error = api_data.get('error', 'UNKNOWN')
+                logger.error(f"[G2_Out] Xe không có: {error}")
+                ExitCacheManager.clear(gate=2)
+                if error == 'BSX_NOT_IN_PARKING':
+                    self._exit_error_gate2("XE KHONG CO", "TRONG HE THONG")
+                else:
+                    self._exit_error_gate2("LOI DU LIEU", "VUI LONG THU LAI")
                 return
             
             expected_ticket = api_data.get('ticket_code', '')
-            if qr_result != expected_ticket:
-                logger.warning(f"[GATE2] Ve khong khop: QR={qr_result} vs DB={expected_ticket}")
-                self._display("out", "VE KHONG KHOP", "VUI LONG THU LAI", gate=2)
+            status = api_data.get('status', '')
+            logger.info(f"[G2_Out] Vé: {expected_ticket} | Status: {status}")
+            
+            if not qr_result:
+                logger.error("[G2_Out] Không đọc được QR")
+                self._exit_error_gate2("KHONG DOC DUOC QR", "VUI LONG THU LAI")
                 return
             
-            logger.info("[GATE2] ✅ Ve KHOP!")
+            logger.info(f"[G2_Out] QR: {qr_result}")
             
-            # Checkout
-            self.db.checkout(plate, qr_result)
-            ExitCacheManager.clear(gate=2)
+            if qr_result != expected_ticket:
+                logger.warning(f"[G2_Out] Vé không khớp: {qr_result} vs {expected_ticket}")
+                self._exit_error_gate2("VE KHONG KHOP", "VUI LONG THU LAI")
+                return
             
-            # Open barrier
-            self._barrier("out", "open", gate=2)
+            logger.info("[G2_Out] Xác thực OK")
+            
+            if status == 'USED':
+                logger.warning("[G2_Out] Vé đã dùng")
+                ExitCacheManager.clear(gate=2)
+                self._exit_error_gate2("VE DA SU DUNG", "VUI LONG THU LAI")
+                return
+            
+            if status == 'PENDING':
+                amount = api_data.get('amount', 0)
+                logger.warning(f"[G2_Out] Chưa thanh toán: {amount:,}đ")
+                self._exit_error_gate2("CHUA THANH TOAN", f"{amount:,}d" if amount else "")
+                return
+            
+            # Checkout + Lưu pending exit để sync sau barrier close
+            self.executor.submit(self.db.checkout, expected_ticket, plate)
+            self.executor.submit(ExitCacheManager.clear, 2)
+            
+            # Lưu pending exit Gate 2
+            self.config.pending_exit_gate2 = {
+                'plate': plate, 'ticket_code': expected_ticket,
+                'frame': frame.copy() if frame is not None else None,
+                'timestamp': time.time()
+            }
+            
+            paid = api_data.get('amount', 0)
+            logger.info(f"[G2_Out] CHECKOUT OK | {plate} | {expected_ticket} | {paid:,}đ")
+            
             self._display("out", "TAM BIET", "HEN GAP LAI", gate=2)
-            
-            time.sleep(3)
-            self._display("out", "X-PARKING", "GATE 2 OUT", gate=2)
+            self._barrier("out", "open", gate=2)
             
         except Exception as e:
-            logger.error(f"[GATE2] Exit error: {e}")
-            self._display("out", "LOI HE THONG", "VUI LONG THU LAI", gate=2)
+            logger.error(f"[G2_Out] Lỗi: {e}")
+            self._exit_error_gate2("LOI HE THONG", "VUI LONG THU LAI")
         finally:
             self.config.waiting_for_qr_gate2 = False
             self.config.current_exit_plate_gate2 = None
             self.config.qr_scan_result_gate2 = None
             self.gate2_exit_lock.release()
             elapsed = time.time() - start_flow
-            logger.info(f"[GATE2] 🏁 Ket thuc xu ly xe ra ({elapsed:.1f}s)\n")
+            logger.info(f"[G2_Out] ========== XONG ({elapsed:.1f}s) ==========\n")
     
-    def _scan_qr_parallel_gate2(self):
-        """[GATE2] Scan QR qua MQTT"""
-        SCAN_TIMEOUT = 25
-        scan_start = time.time()
-        
-        for attempt in range(5):
-            if time.time() - scan_start > SCAN_TIMEOUT:
-                break
-            
-            if not self.config.waiting_for_qr_gate2:
-                break
-            
-            self.config.qr_scan_result_gate2 = None
-            
-            # Trigger ESP32-CAM Gate2
-            self._trigger_camera(gate=2)
-            
-            # Wait for response
-            wait_start = time.time()
-            while time.time() - wait_start < 5:
-                if self.config.qr_scan_result_gate2:
-                    return self.config.qr_scan_result_gate2
-                time.sleep(0.1)
-            
-            if attempt < 4:
-                logger.info(f"[GATE2] 📸 Retry QR ({attempt + 2}/5)")
-                self._display("out", "SCAN LAI", f"LAN {attempt + 2}/5", gate=2)
-                time.sleep(0.2)
-        
-        return None
+    def _exit_error_gate2(self, line1, line2="VUI LONG THU LAI"):
+        self._display("out", line1, line2, gate=2)
+        time.sleep(3)
+        self._display("out", "X-PARKING", "Exit", gate=2)
     
-    def _process_qr_from_bytes_gate2(self, jpeg_bytes):
-        """[GATE2] Xu ly QR tu anh JPEG binary"""
-        if not self.config.waiting_for_qr_gate2:
-            return
-        
-        try:
-            from qr_scanner import scan_qr_from_bytes, extract_ticket_code
-            import cv2
-            import numpy as np
-            from datetime import datetime
-            import os
-            
-            # Decode JPEG
-            nparr = np.frombuffer(jpeg_bytes, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if frame is None:
-                logger.warning("[GATE2] Decode anh loi")
-                return
-            
-            # Scan QR
-            qr_content = scan_qr_from_bytes(jpeg_bytes)
-            
-            # Try grayscale
-            if not qr_content:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                from qr_scanner import scan_qr_from_frame
-                qr_content = scan_qr_from_frame(gray)
-            
-            if not qr_content:
-                logger.warning("[GATE2] ⚠️ QR khong nhan dien duoc")
-                return
-            
-            ticket_code = extract_ticket_code(qr_content)
-            if ticket_code:
-                logger.info(f"[GATE2] ✅ QR: {ticket_code}")
-                self.config.qr_scan_result_gate2 = ticket_code
-                
-                # Save image
-                try:
-                    tickets_dir = os.path.join(os.path.dirname(__file__), 'tickets_out_gate2')
-                    os.makedirs(tickets_dir, exist_ok=True)
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    filename = f"{ticket_code}_{timestamp}.jpg"
-                    cv2.imwrite(os.path.join(tickets_dir, filename), frame)
-                    logger.info(f"[GATE2] 💾 Luu anh ve: {filename}")
-                except Exception as e:
-                    logger.warning(f"[GATE2] Luu anh loi: {e}")
-            else:
-                logger.warning("[GATE2] QR khong hop le")
-                
-        except Exception as e:
-            logger.error(f"[GATE2] Xu ly QR loi: {e}")
-
     def shutdown(self):
         logger.info("Shutting down...")
         self.mqtt_gate1.disconnect()

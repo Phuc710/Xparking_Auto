@@ -1,16 +1,24 @@
 <?php
 /**
- * API RESPONSE HELPER
- * Chuẩn hóa response cho tất cả API
+ * API RESPONSE HELPER - OPTIMIZED FOR MULTI-THREADING
+ * Chuẩn hóa response cho tất cả API với tối ưu tốc độ
  */
 
 class ApiResponse {
     
     public static function init() {
+        // Performance headers
         header('Content-Type: application/json; charset=utf-8');
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type');
+        header('Cache-Control: no-cache, must-revalidate');
+        header('X-Content-Type-Options: nosniff');
+        
+        // Enable output buffering for faster response
+        if (!ob_get_level()) {
+            ob_start('ob_gzhandler');
+        }
         
         if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
             http_response_code(200);

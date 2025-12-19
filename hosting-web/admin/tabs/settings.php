@@ -74,6 +74,47 @@ $hourly_display = ($current_price_minutes > 0) ? round($current_price_amount * 6
         </form>
     </div>
 
+    <!-- Cài đặt số chỗ đỗ xe -->
+    <div style="background: #fff; padding: 1.5rem; border-radius: 10px; margin-bottom: 2rem; border: 2px solid #3b82f6;">
+        <h3 style="margin-bottom: 1rem; color: #3b82f6;">
+            <i class="fas fa-parking"></i> Cài đặt chỗ đỗ xe
+        </h3>
+
+        <?php
+        // Lấy slot settings hiện tại
+        $total_slots_setting = dbGetOne('settings', 'key', 'total_slots');
+        $occupied_slots_setting = dbGetOne('settings', 'key', 'occupied_slots');
+        $current_total_slots = intval($total_slots_setting['value'] ?? 50);
+        $current_occupied_slots = intval($occupied_slots_setting['value'] ?? 0);
+        $current_available_slots = $current_total_slots - $current_occupied_slots;
+        ?>
+
+        <form action="admin.php?tab=settings" method="post">
+            <input type="hidden" name="action" value="update_slot_settings">
+            
+            <div class="form-group">
+                <label for="total_slots" class="form-label">Tổng số chỗ đỗ xe</label>
+                <input type="number" id="total_slots" name="total_slots" class="form-control"
+                    value="<?php echo $current_total_slots; ?>" min="1" max="1000" required>
+                <small style="color: #6b7280;">Số chỗ tối đa mà bãi xe có thể chứa</small>
+            </div>
+
+            <div style="margin-top: 1rem; padding: 1rem; background: #eff6ff; border-radius: 8px;">
+                <p style="margin: 0; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i> 
+                    <strong>Tình trạng hiện tại:</strong> 
+                    <?php echo $current_occupied_slots; ?>/<?php echo $current_total_slots; ?> 
+                    (Đang sử dụng/Tổng số) - 
+                    Còn trống: <strong style="color: #10b981;"><?php echo $current_available_slots; ?> chỗ</strong>
+                </p>
+            </div>
+
+            <button type="submit" class="btn btn-primary" style="margin-top: 1rem;">
+                <i class="fas fa-save"></i> Lưu cài đặt slot
+            </button>
+        </form>
+    </div>
+
     <div style="background: #fff; padding: 1.5rem; border-radius: 10px;">
         <h3 style="margin-bottom: 1rem;">
             <i class="fas fa-bullhorn"></i> Gửi thông báo

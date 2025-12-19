@@ -19,7 +19,7 @@ DROP TABLE IF EXISTS bookings;
 DROP TABLE IF EXISTS vehicles;
 DROP TABLE IF EXISTS notifications;
 DROP TABLE IF EXISTS system_logs;
-DROP TABLE IF EXISTS parking_slots;
+-- parking_slots removed - using settings table for slot count
 DROP TABLE IF EXISTS settings;
 DROP TABLE IF EXISTS users;
 
@@ -52,14 +52,9 @@ CREATE TABLE settings (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Bảng parking_slots
-CREATE TABLE parking_slots (
-    id VARCHAR(10) PRIMARY KEY,
-    status ENUM('empty', 'occupied', 'maintenance', 'reserved') DEFAULT 'empty',
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- parking_slots removed - slot count managed in settings table
 
--- Bảng vehicles
+-- Bảng vehicles (slot_id removed - using global count)
 CREATE TABLE vehicles (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     license_plate VARCHAR(20) NOT NULL,
@@ -67,19 +62,16 @@ CREATE TABLE vehicles (
     booking_id BIGINT DEFAULT NULL,
     entry_time DATETIME DEFAULT NULL,
     exit_time DATETIME DEFAULT NULL,
-    slot_id VARCHAR(10) DEFAULT NULL,
     ticket_code VARCHAR(20) DEFAULT NULL,
     status ENUM('in_parking', 'exited', 'pending') DEFAULT 'pending',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
-    FOREIGN KEY (slot_id) REFERENCES parking_slots(id) ON DELETE SET NULL
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Bảng bookings
+-- Bảng bookings (slot_id removed - using global count)
 CREATE TABLE bookings (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     user_id BIGINT NOT NULL,
-    slot_id VARCHAR(10) DEFAULT NULL,
     license_plate VARCHAR(20) NOT NULL,
     start_time DATETIME NOT NULL,
     end_time DATETIME NOT NULL,
@@ -92,8 +84,7 @@ CREATE TABLE bookings (
     actual_entry_time DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (slot_id) REFERENCES parking_slots(id) ON DELETE SET NULL
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Bảng tickets
@@ -212,8 +203,7 @@ CREATE INDEX idx_bookings_ticket ON bookings(ticket_code);
 CREATE INDEX idx_bookings_checked_in ON bookings(checked_in);
 CREATE INDEX idx_bookings_time ON bookings(start_time, end_time);
 
--- PARKING_SLOTS - Real-time availability
-CREATE INDEX idx_parking_status ON parking_slots(status);
+-- PARKING_SLOTS removed - using settings for slot count
 
 -- PAYMENTS - Real-time polling
 CREATE INDEX idx_payments_ref ON payments(payment_ref);
@@ -245,43 +235,53 @@ ALTER TABLE vehicles ADD CONSTRAINT fk_vehicles_booking
 INSERT INTO users (username, password, email, full_name, role) VALUES 
 ('admin', '$2b$10$lQPGnj2SXXKtN2pUu5Cqk.GB59SW5HOfm3M4y2/o/cMS/khWNCFP2', 'admin@xparking.com', 'System Administrator', 'admin');
 
--- Parking slots (4 chỗ mặc định)
-INSERT INTO parking_slots (id, status) VALUES 
-('A01', 'empty'),
-('A02', 'empty'),
-('A03', 'empty'),
-('A04', 'empty');
-
--- Settings mặc định
+-- Settings mặc định (slot count managed here)
 INSERT INTO settings (`key`, value, description) VALUES 
+('total_slots', '50', 'Tổng số chỗ đỗ xe'),
+('occupied_slots', '0', 'Số chỗ đang sử dụng'),
 ('price_amount', '5000', 'Số tiền tính phí (VNĐ)'),
 ('price_minutes', '60', '5000/1h'),
 ('min_price', '5000', 'Giá tối thiểu (VNĐ)');
 
 -- ===================================================
--- BƯỚC 5: STORED PROCEDURES
+-- BƯỚC 5: STORED PROCEDURES (SIMPLIFIED - No slot table)
 -- ===================================================
 
--- Xóa procedures cũ nếu có
-DROP PROCEDURE IF EXISTS GetAvailableSlots;
+DROP PROCEDURE IF EXISTS GetSlotCount;
+DROP PROCEDURE IF EXISTS IncrementSlot;
+DROP PROCEDURE IF EXISTS DecrementSlot;
 DROP PROCEDURE IF EXISTS ProcessVehicleEntry;
 DROP PROCEDURE IF EXISTS ProcessVehicleExit;
 
 DELIMITER //
 
--- Procedure: Lấy slots available nhanh
-CREATE PROCEDURE GetAvailableSlots()
+-- Procedure: Lấy slot count
+CREATE PROCEDURE GetSlotCount()
 BEGIN
-    SELECT id, status 
-    FROM parking_slots 
-    WHERE status = 'empty' 
-    ORDER BY id;
+    SELECT 
+        (SELECT CAST(value AS UNSIGNED) FROM settings WHERE `key` = 'total_slots') AS total_slots,
+        (SELECT CAST(value AS UNSIGNED) FROM settings WHERE `key` = 'occupied_slots') AS occupied_slots,
+        (SELECT CAST(value AS UNSIGNED) FROM settings WHERE `key` = 'total_slots') - 
+        (SELECT CAST(value AS UNSIGNED) FROM settings WHERE `key` = 'occupied_slots') AS available_slots;
 END //
 
--- Procedure: Xử lý xe vào
+-- Procedure: Xe VÀO (+1)
+CREATE PROCEDURE IncrementSlot()
+BEGIN
+    UPDATE settings SET value = CAST(CAST(value AS UNSIGNED) + 1 AS CHAR) 
+    WHERE `key` = 'occupied_slots';
+END //
+
+-- Procedure: Xe RA (-1)
+CREATE PROCEDURE DecrementSlot()
+BEGIN
+    UPDATE settings SET value = CAST(GREATEST(CAST(value AS UNSIGNED) - 1, 0) AS CHAR) 
+    WHERE `key` = 'occupied_slots';
+END //
+
+-- Procedure: Xử lý xe vào (simplified)
 CREATE PROCEDURE ProcessVehicleEntry(
     IN p_plate VARCHAR(20),
-    IN p_slot VARCHAR(10), 
     IN p_booking_id BIGINT
 )
 BEGIN
@@ -293,25 +293,22 @@ BEGIN
     
     START TRANSACTION;
     
-    -- Lock và check slot
-    SELECT status FROM parking_slots WHERE id = p_slot FOR UPDATE;
-    
-    -- Update slot status
-    UPDATE parking_slots SET status = 'occupied' WHERE id = p_slot;
+    -- Increment slot count
+    UPDATE settings SET value = CAST(CAST(value AS UNSIGNED) + 1 AS CHAR) 
+    WHERE `key` = 'occupied_slots';
     
     -- Insert vehicle record
-    INSERT INTO vehicles (license_plate, slot_id, status, booking_id, entry_time) 
-    VALUES (p_plate, p_slot, 'in_parking', p_booking_id, NOW());
+    INSERT INTO vehicles (license_plate, status, booking_id, entry_time) 
+    VALUES (p_plate, 'in_parking', p_booking_id, NOW());
     
     COMMIT;
 END //
 
--- Procedure: Xử lý xe ra
+-- Procedure: Xử lý xe ra (simplified)
 CREATE PROCEDURE ProcessVehicleExit(
     IN p_ticket VARCHAR(20)
 )
 BEGIN
-    DECLARE v_slot VARCHAR(10);
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         ROLLBACK;
@@ -320,19 +317,14 @@ BEGIN
     
     START TRANSACTION;
     
-    -- Get vehicle info với lock
-    SELECT slot_id INTO v_slot 
-    FROM vehicles 
-    WHERE ticket_code = p_ticket AND status = 'in_parking' 
-    FOR UPDATE;
-    
     -- Update vehicle status
     UPDATE vehicles 
     SET status = 'exited', exit_time = NOW() 
     WHERE ticket_code = p_ticket;
     
-    -- Free slot
-    UPDATE parking_slots SET status = 'empty' WHERE id = v_slot;
+    -- Decrement slot count
+    UPDATE settings SET value = CAST(GREATEST(CAST(value AS UNSIGNED) - 1, 0) AS CHAR) 
+    WHERE `key` = 'occupied_slots';
     
     COMMIT;
 END //
@@ -347,7 +339,7 @@ ANALYZE TABLE users;
 ANALYZE TABLE vehicles;
 ANALYZE TABLE tickets;
 ANALYZE TABLE bookings;
-ANALYZE TABLE parking_slots;
 ANALYZE TABLE payments;
 ANALYZE TABLE webhook_payments;
+ANALYZE TABLE settings;
 

@@ -42,7 +42,7 @@ function createTicket($params) {
         'license_plate' => $plate,
         'time_in' => date('Y-m-d H:i:s'),
         'qr_url' => $qr,
-        'status' => 'ACTIVE',
+        'status' => 'PENDING',
         'payment_method' => 'webhook'
     ]);
     
@@ -80,7 +80,7 @@ function getTicketInfo($code) {
     $booking_id = $t['booking_id'] ?? null;
     $is_expired = false; // Booking hết hạn mà xe chưa vào
     
-    if ($t['status'] === 'ACTIVE' && $t['time_in']) {
+    if ($t['status'] === 'PENDING' && $t['time_in']) {
         // Xe vãng lai chưa thanh toán
         $mins = max(1, (int)round((time() - strtotime($t['time_in'])) / 60));
         $amt = max($pricing['min_price'], (int)round($mins * $pricing['price_per_minute']));

@@ -9,10 +9,10 @@ date_default_timezone_set('Asia/Ho_Chi_Minh');
 
 // === DATABASE (MySQL) ===
 
-define('DB_HOST', 'localhost');
-define('DB_NAME', 'xparking');
-define('DB_USER', 'root');
-define('DB_PASS', '');
+// define('DB_HOST', 'localhost');
+// define('DB_NAME', 'xparking1_csdl');
+// define('DB_USER', 'root');
+// define('DB_PASS', '');
 
 // PDO Connection - XParking Database
 function db() {
@@ -50,7 +50,7 @@ function now_vn() {
 
 // === SEPAY ===
 define('SEPAY_API_URL', 'https://my.sepay.vn/userapi/transactions/list');
-define('SEPAY_TOKEN', 'TRK794OUY0TJVVIPCASYOULQGNKI6DME2CXC8H0P4ZGDLRAK6FS1HWFV5DHGYNGJ');
+define('SEPAY_TOKEN', '');
 define('SEPAY_QR_API', 'https://qr.sepay.vn/img');
 
 // === VIETQR ===

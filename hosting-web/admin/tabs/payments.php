@@ -120,6 +120,10 @@ if ($filter_type || $filter_plate || $filter_from || $filter_to) {
                                     $statusClass = 'danger';
                                     $statusText = 'Hết hạn';
                                     break;
+                                case 'cancelled':
+                                    $statusClass = 'danger';
+                                    $statusText = 'Đã hủy';
+                                    break;
                                 default:
                                     $statusClass = 'warning';
                                     $statusText = 'Chờ thanh toán';
@@ -171,6 +175,10 @@ if ($filter_type || $filter_plate || $filter_from || $filter_to) {
                         case 'expired':
                             $statusClass = 'danger';
                             $statusText = 'Hết hạn';
+                            break;
+                        case 'cancelled':
+                            $statusClass = 'danger';
+                            $statusText = 'Đã hủy';
                             break;
                         default:
                             $statusClass = 'warning';

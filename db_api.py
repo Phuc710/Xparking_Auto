@@ -79,7 +79,7 @@ class DatabaseAPI:
         
         if cookie == "OK":
             self.connected = True
-            logger.info("✅ API: Kết nối OK")
+            logger.info("API connected")
             return True
         elif cookie:
             self.session.cookies.set('__test', cookie, domain=self.domain)
@@ -87,26 +87,41 @@ class DatabaseAPI:
                 r = self.session.get(self.site_url, timeout=10)
                 if 'toNumbers' not in r.text:
                     self.connected = True
-                    logger.info("✅ API: Kết nối OK (bypass)")
+                    logger.info("API connected (bypass)")
                     return True
             except:
                 pass
         
-        logger.error("❌ API: Kết nối thất bại")
+        logger.error("API connection failed")
         self.connected = False
         return False
     
-    def _call(self, action, params=None):
-        """Gọi API gateway"""
-        try:
-            data = {'action': action}
-            if params:
-                data.update(params)
-            r = self.session.get(self.gateway_url, params=data, timeout=10)
-            return r.json() if r.status_code == 200 else None
-        except Exception as e:
-            logger.error(f"API error: {e}")
-            return None
+    def _call(self, action, params=None, retries=2):
+        """Gọi API gateway với retry logic"""
+        data = {'action': action}
+        if params:
+            data.update(params)
+        
+        for attempt in range(retries + 1):
+            try:
+                r = self.session.get(self.gateway_url, params=data, timeout=10)
+                if r.status_code == 200:
+                    return r.json()
+                else:
+                    logger.warning(f"API {action}: HTTP {r.status_code}")
+            except requests.exceptions.Timeout:
+                logger.warning(f"API {action}: Timeout ({attempt+1}/{retries+1})")
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"API {action}: Connection error ({attempt+1}/{retries+1})")
+            except Exception as e:
+                logger.error(f"API {action}: {e}")
+            
+            # Retry delay
+            if attempt < retries:
+                import time
+                time.sleep(0.5)
+        
+        return None
     
     def now(self):
         return datetime.now(VN_TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -165,7 +180,7 @@ class DatabaseAPI:
         return self._call('checkout', {
             'ticket_code': ticket_code,
             'license_plate': license_plate
-        })
+        }, retries=0)
     
     def get_vehicle_by_plate(self, license_plate):
         """Tìm xe theo biển số"""
@@ -182,17 +197,43 @@ class DatabaseAPI:
             return r
         return {'found': False, 'error': 'API_ERROR'}
 
-    # === SLOTS ===
-    def get_slots(self):
-        """Lấy trạng thái các slot"""
-        r = self._call('get_slots')
-        return r.get('slots', []) if r and r.get('success') else []
+    # === SLOTS (SIMPLIFIED - Global Count) ===
+    def get_slot_count(self):
+        """Lấy slot count: {total, occupied, available}"""
+        r = self._call('get_slot_count')
+        if r and r.get('success'):
+            return {
+                'total': int(r.get('total_slots', 50)),
+                'occupied': int(r.get('occupied_slots', 0)),
+                'available': int(r.get('available_slots', 50))
+            }
+        return {'total': 50, 'occupied': 0, 'available': 50}
     
     def get_available_slots(self):
-        """Lấy các slot trống"""
-        slots = self.get_slots()
-        return [s['id'] for s in slots if s.get('status') == 'empty']
+        """Lấy số slot trống (số lượng > 0 nghĩa là còn chỗ)"""
+        count = self.get_slot_count()
+        # Trả về list với 1 item nếu còn chỗ (để compatible với code cũ)
+        if count['available'] > 0:
+            return ['SLOT']  # Dummy slot ID
+        return []
     
-    def update_slot(self, slot_id, status):
-        """Cập nhật trạng thái slot"""
-        return self._call('update_slot', {'slot_id': slot_id, 'status': status})
+    def increment_slot(self):
+        """Xe VÀO: +1 slot"""
+        r = self._call('increment_slot')
+        if r and r.get('success'):
+            logger.info(f"[SLOT] +1 → {r.get('occupied_slots', '?')}/{r.get('total_slots', '?')}")
+        return r
+    
+    def decrement_slot(self):
+        """Xe RA: -1 slot"""
+        r = self._call('decrement_slot')
+        if r and r.get('success'):
+            logger.info(f"[SLOT] -1 → {r.get('occupied_slots', '?')}/{r.get('total_slots', '?')}")
+        return r
+    
+    def sync_slot_to_hosting(self):
+        """Gửi slot count lên hosting (sau barrier close)"""
+        count = self.get_slot_count()
+        logger.info(f"[SYNC] Slot: {count['occupied']}/{count['total']}")
+        # Đã lưu trên DB rồi, không cần gửi thêm
+        return count

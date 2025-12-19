@@ -157,10 +157,17 @@ switch ($tab) {
         break;
     case 'overview':
         $user_stats = get_user_statistics($_SESSION['user_id']);
-        $slots = get_slots_display_status();
         break;
     case 'booking':
-        $available_slots = get_booking_available_slots();
+        // Lấy slot count từ settings
+        $total_slot_setting = dbGetOne('settings', 'key', 'total_slots');
+        $occupied_slot_setting = dbGetOne('settings', 'key', 'occupied_slots');
+        $total_slots = intval($total_slot_setting['value'] ?? 50);
+        $occupied_slots = intval($occupied_slot_setting['value'] ?? 0);
+        $available = $total_slots - $occupied_slots;
+        
+        // $available_slots để check có cho booking không
+        $available_slots = $available > 0 ? range(1, $available) : [];
         break;
     case 'vehicles':
         $user_vehicles = get_user_vehicles($_SESSION['user_id']);

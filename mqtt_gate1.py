@@ -1,192 +1,98 @@
-"""
-MQTT Handler cho Gate 1
-Xu ly tat ca giao tiep MQTT giua Python va ESP32 Gate1 + ESP32-CAM Gate1
-"""
-
 import paho.mqtt.client as mqtt
 import json
 import logging
-import threading
 
 logger = logging.getLogger('XParking')
 
 class MQTTGate1:
-    def __init__(self, config, system_functions):
+    def __init__(self, config, system):
         self.config = config
-        self.system = system_functions
+        self.system = system
         self.mqtt = None
-        self.gate_id = "gate1"
-        
-        # Topics
+        # ESP32-CAM giờ là HTTP Server, không cần MQTT trigger nữa
         self.topics = {
-            'entrance': f'xparking/{self.gate_id}/entrance',
-            'exit': f'xparking/{self.gate_id}/exit',
-            'slots': f'xparking/{self.gate_id}/slots',
-            'alert': f'xparking/{self.gate_id}/alert',
-            'status': f'xparking/{self.gate_id}/status',
-            'command': f'xparking/{self.gate_id}/command',
-            'cam_trigger': f'xparking/{self.gate_id}/cam/trigger',
-            'cam_image': f'xparking/{self.gate_id}/cam/image',
-            'cam_status': f'xparking/{self.gate_id}/cam/status'
+            'entrance': 'xparking/gate1/entrance',
+            'exit': 'xparking/gate1/exit',
+            'slots': 'xparking/gate1/slots',
+            'alert': 'xparking/gate1/alert',
+            'command': 'xparking/gate1/command',
         }
     
     def connect(self):
-        """Ket noi MQTT broker"""
         try:
             self.mqtt = mqtt.Client()
             self.mqtt.on_connect = self._on_connect
             self.mqtt.on_message = self._on_message
-            self.mqtt.connect(
-                self.config.config['mqtt_broker'],
-                self.config.config['mqtt_port'], 60
-            )
+            self.mqtt.connect(self.config.config['mqtt_broker'], self.config.config['mqtt_port'], 60)
             self.mqtt.loop_start()
-            logger.info(f"[GATE1] MQTT connecting...")
             return True
         except Exception as e:
-            logger.error(f"[GATE1] MQTT error: {e}")
+            logger.error(f"[G1] MQTT error: {e}")
             return False
     
     def _on_connect(self, client, userdata, flags, rc):
-        """Callback khi ket noi thanh cong"""
         if rc == 0:
-            logger.info("[GATE1] MQTT connected")
-            
-            # Subscribe topics
+            logger.info("[G1] MQTT connected")
             for name, topic in self.topics.items():
-                if name not in ['command', 'cam_trigger']:  # Khong subscribe topics publish
+                if name != 'command':
                     client.subscribe(topic)
-                    logger.info(f"[GATE1] Subscribe: {topic}")
-            
-            # Gui lenh khoi tao
-            self.display("in", "X-PARKING", "GATE 1 IN")
-            self.display("out", "X-PARKING", "GATE 1 OUT")
-        else:
-            logger.error(f"[GATE1] MQTT connect fail: {rc}")
+            self.display("in", "X-PARKING", "GATE 1")
+            self.display("out", "X-PARKING", "GATE 1")
     
     def _on_message(self, client, userdata, msg):
-        """Xu ly message tu MQTT"""
         topic = msg.topic
-        
         try:
-            # Anh binary tu ESP32-CAM
-            if topic == self.topics['cam_image']:
-                if self.config.waiting_for_qr:
-                    logger.info(f"[GATE1] 📷 Nhan anh: {len(msg.payload)//1024}KB")
-                    self.system.executor.submit(self.system._process_qr_from_bytes, msg.payload)
-                return
-            
-            # Text messages
+            # ESP32-CAM giờ gửi ảnh qua HTTP, không qua MQTT nữa
             payload = msg.payload.decode('utf-8')
+            data = json.loads(payload) if payload.startswith('{') else {'event': payload}
+            event = data.get('event', '')
             
-            # Entrance events
             if topic == self.topics['entrance']:
-                data = json.loads(payload) if payload.startswith('{') else {'event': payload}
-                event = data.get('event', '')
-                
                 if event == 'CAR_DETECT_IN':
-                    logger.info("[GATE1] 🚗 Xe vao")
+                    logger.info("[G1_In] detected")
                     self.system.executor.submit(self.system.handle_entry)
-                elif event == 'CAR_PASSED_IR':
-                    logger.info("[GATE1] ✅ Xe qua cong vao")
+                elif event == 'CAR_ENTERED':
+                    # Xe đã vào (barrier closed) → +1 slot, sync hosting
+                    logger.info("[G1_In] CAR_ENTERED → +1 slot")
+                    self.system.executor.submit(self.system._on_car_entered, 1)
             
-            # Exit events
             elif topic == self.topics['exit']:
-                data = json.loads(payload) if payload.startswith('{') else {'event': payload}
-                event = data.get('event', '')
-                
                 if event == 'CAR_DETECT':
-                    logger.info("[GATE1] 🚀 Xe ra")
+                    logger.info("[G1_Out] detected")
                     self.system.executor.submit(self.system.handle_exit)
                 elif event == 'CAR_EXITED':
-                    logger.info("[GATE1] ✅ Xe da ra")
-                elif event == 'CAR_REVERSE':
-                    logger.info("[GATE1] ⚠️ Xe lui ra")
-                elif event in ['VERIFY_TIMEOUT', 'BARRIER_TIMEOUT']:
-                    logger.warning(f"[GATE1] ⏱️ {event}")
+                    # Xe đã ra (barrier closed) → -1 slot, sync hosting
+                    logger.info("[G1_Out] CAR_EXITED → -1 slot")
+                    self.system.executor.submit(self.system._on_car_exited, 1)
             
-            # Slots update
-            elif topic == self.topics['slots']:
-                self._handle_slot_update(payload)
-            
-            # Status update
-            elif topic == self.topics['status']:
-                self._handle_status_update(payload)
-            
-            # Alert
             elif topic == self.topics['alert']:
-                self._handle_alert(payload)
+                self.system._handle_alert(payload)
+            
+            # slots topic không cần xử lý nữa - dùng global count
                 
         except Exception as e:
-            logger.error(f"[GATE1] MQTT message error: {e}")
-    
-    def _handle_slot_update(self, payload):
-        """Xu ly cap nhat slot"""
-        try:
-            data = json.loads(payload)
-            slot_id = data.get('slot_id')
-            status = data.get('status')
-            if slot_id and status:
-                self.system.gui.update_slot_status(slot_id, status)
-        except:
-            pass
-    
-    def _handle_status_update(self, payload):
-        """Xu ly cap nhat status"""
-        logger.info(f"[GATE1] Status: {payload}")
-    
-    def _handle_alert(self, payload):
-        """Xu ly canh bao"""
-        logger.warning(f"[GATE1] ⚠️ Alert: {payload}")
+            logger.error(f"[G1] MQTT msg error: {e}")
     
     def publish(self, topic_name, message):
-        """Publish message"""
         if self.mqtt and self.mqtt.is_connected():
             topic = self.topics.get(topic_name)
             if topic:
-                if isinstance(message, (dict, list)):
+                if isinstance(message, dict):
                     message = json.dumps(message)
                 self.mqtt.publish(topic, message)
     
     def display(self, station, line1, line2=""):
-        """Hien thi message tren LCD"""
-        if station == 'in':
-            self.publish('command', {
-                "event": "SHOW_MESSAGE_IN",
-                "station": "IN",
-                "line1": line1,
-                "line2": line2
-            })
-        else:
-            self.publish('command', {
-                "event": "DISPLAY_OUT",
-                "station": "OUT",
-                "line1": line1,
-                "line2": line2
-            })
+        event = "SHOW_MESSAGE_IN" if station == 'in' else "DISPLAY_OUT"
+        self.publish('command', {"event": event, "station": station.upper(), "line1": line1, "line2": line2})
     
     def barrier(self, station, action):
-        """Dieu khien barrier"""
-        if station == 'in':
-            if action == 'open':
-                self.publish('command', {
-                    "event": "OPEN_BARRIER",
-                    "station": "IN"
-                })
+        if station == 'in' and action == 'open':
+            self.publish('command', {"event": "OPEN_BARRIER", "station": "IN"})
         else:
-            self.publish('command', {
-                "event": "BARRIER_OUT",
-                "station": "OUT",
-                "action": action
-            })
-    
-    def trigger_camera(self):
-        """Trigger ESP32-CAM chup anh"""
-        self.publish('cam_trigger', 'capture')
+            self.publish('command', {"event": "BARRIER_OUT", "station": "OUT", "action": action})
     
     def disconnect(self):
-        """Ngat ket noi MQTT"""
         if self.mqtt:
             self.mqtt.loop_stop()
             self.mqtt.disconnect()
-            logger.info("[GATE1] MQTT disconnected")
+            logger.info("[G1] MQTT disconnected")

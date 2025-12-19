@@ -1,7 +1,7 @@
 <div class="card">
     <h2 class="card-title"><i class="fas fa-tachometer-alt"></i> Tổng quan</h2>
 
-    <div class="stats">
+<div class="stats">
         <div class="stat-card">
             <div class="stat-icon">
                 <i class="fas fa-car"></i>
@@ -15,14 +15,14 @@
                 <i class="fas fa-parking"></i>
             </div>
             <?php
-                    $available_count = 0;
-                    foreach ($slots as $slot) {
-                        if ($slot['actual_status'] === 'empty') {
-                            $available_count++;
-                        }
-                    }
+                    // Lấy slot count từ settings table
+                    $total_slot_setting = dbGetOne('settings', 'key', 'total_slots');
+                    $occupied_slot_setting = dbGetOne('settings', 'key', 'occupied_slots');
+                    $total_slots = intval($total_slot_setting['value'] ?? 50);
+                    $occupied_slots = intval($occupied_slot_setting['value'] ?? 0);
+                    $available_slots = $total_slots - $occupied_slots;
                     ?>
-            <div class="stat-value"><?php echo $available_count; ?>/<?php echo count($slots); ?></div>
+            <div class="stat-value"><?php echo $available_slots; ?>/<?php echo $total_slots; ?></div>
             <div class="stat-label">Slot trống</div>
         </div>
 
@@ -38,45 +38,6 @@
             <div class="stat-label">Đặt chỗ hiện tại</div>
 
         </div>
-    </div>
-</div>
-
-<div class="card">
-    <h2 class="card-title"><i class="fas fa-parking"></i> Tình trạng bãi đỗ xe</h2>
-
-    <div class="slot-grid">
-        <?php foreach ($slots as $slot): 
-                    $statusClass = '';
-                    $statusText = '';
-                    $statusColor = '';
-                    
-                    switch ($slot['actual_status']) {
-                        case 'occupied':
-                            $statusClass = 'danger';
-                            $statusText = 'Có xe';
-                            $statusColor = '#ef4444';
-                            break;
-                        case 'maintenance':
-                            $statusClass = 'secondary';
-                            $statusText = 'Bảo trì';
-                            $statusColor = '#6b7280';
-                            break;
-                        default:
-                            $statusClass = 'success';
-                            $statusText = 'Trống';
-                            $statusColor = '#10b981';
-                    }
-                ?>
-        <div class="slot-card">
-            <div class="slot-icon">
-                <i class="fas fa-car" style="color: <?php echo $statusColor; ?>"></i>
-            </div>
-            <div class="slot-id"><?php echo htmlspecialchars($slot['id']); ?></div>
-            <div class="slot-status">
-                <span class="badge badge-<?php echo $statusClass; ?>"><?php echo $statusText; ?></span>
-            </div>
-        </div>
-        <?php endforeach; ?>
     </div>
 </div>
 

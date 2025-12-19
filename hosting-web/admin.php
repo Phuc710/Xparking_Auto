@@ -19,30 +19,7 @@ $tab = $_GET['tab'] ?? 'dashboard';
 // Handle admin actions
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     switch ($_POST['action']) {
-        case 'update_slot':
-            $slot_id = $_POST['slot_id'] ?? '';
-            $status = $_POST['status'] ?? '';
 
-            if (empty($slot_id) || empty($status)) {
-                set_flash_message('error', 'Thiếu thông tin cần thiết!');
-                redirect('admin.php?tab=slots');
-                break;
-            }
-
-            // Only allow empty <-> maintenance transitions
-            if (!in_array($status, ['empty', 'maintenance'])) {
-                set_flash_message('error', 'Chỉ có thể chuyển đổi giữa trạng thái trống và bảo trì!');
-                redirect('admin.php?tab=slots');
-                break;
-            }
-
-            if (update_slot_status($slot_id, $status)) {
-                set_flash_message('success', 'Cập nhật trạng thái slot thành công!');
-            } else {
-                set_flash_message('error', 'Có lỗi xảy ra khi cập nhật slot!');
-            }
-            redirect('admin.php?tab=slots');
-            break;
 
         case 'delete_notification':
             try {
@@ -131,6 +108,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
             redirect('admin.php?tab=settings');
             break;
+            
+        case 'update_slot_settings':
+            $total_slots = intval($_POST['total_slots'] ?? 50);
+            
+            if ($total_slots < 1 || $total_slots > 1000) {
+                set_flash_message('error', 'Số chỗ đỗ phải từ 1 đến 1000!');
+                redirect('admin.php?tab=settings');
+                break;
+            }
+            
+            try {
+                $db = db();
+                
+                // Kiểm tra số slot đang sử dụng
+                $occupied_setting = dbGetOne('settings', 'key', 'occupied_slots');
+                $current_occupied = intval($occupied_setting['value'] ?? 0);
+                
+                // Không cho phép giảm total_slots xuống thấp hơn occupied
+                if ($total_slots < $current_occupied) {
+                    set_flash_message('error', "Không thể set tổng slot thấp hơn số slot đang sử dụng ($current_occupied)!");
+                    redirect('admin.php?tab=settings');
+                    break;
+                }
+                
+                // Update total_slots
+                $stmt = $db->prepare("
+                    INSERT INTO settings (`key`, value) VALUES (?, ?)
+                    ON DUPLICATE KEY UPDATE value = VALUES(value)
+                ");
+                $stmt->execute(['total_slots', (string)$total_slots]);
+                
+                set_flash_message('success', 'Cập nhật tổng số chỗ đỗ thành công: ' . $total_slots . ' chỗ');
+            } catch (Exception $e) {
+                error_log("Update slot settings error: " . $e->getMessage());
+                set_flash_message('error', 'Lỗi cập nhật slot settings!');
+            }
+            redirect('admin.php?tab=settings');
+            break;
     }
 }
 
@@ -138,13 +153,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 switch ($tab) {
     case 'dashboard':
         $active_vehicles = get_active_vehicles();
-        $slots = get_all_slots();
         break;
     case 'vehicles':
         $all_vehicles = get_all_vehicles_history();
-        break;
-    case 'slots':
-        $slots = get_all_slots();
         break;
         
     case 'users':
@@ -252,13 +263,6 @@ switch ($tab) {
                     </a>
                 </li>
                 <li class="mobile-menu-item">
-                    <a href="admin.php?tab=slots"
-                        class="mobile-menu-link <?php echo $tab === 'slots' ? 'active' : ''; ?>">
-                        <i class="fas fa-parking"></i>
-                        Quản lý slots
-                    </a>
-                </li>
-                <li class="mobile-menu-item">
                     <a href="admin.php?tab=users"
                         class="mobile-menu-link <?php echo $tab === 'users' ? 'active' : ''; ?>">
                         <i class="fas fa-users"></i>
@@ -342,11 +346,6 @@ switch ($tab) {
                     <a href="admin.php?tab=revenue"
                         class="sidebar-link <?php echo $tab === 'revenue' ? 'active' : ''; ?>">
                         <i class="fas fa-chart-line"></i> Doanh thu
-                    </a>
-                </li>
-                <li class="sidebar-item">
-                    <a href="admin.php?tab=slots" class="sidebar-link <?php echo $tab === 'slots' ? 'active' : ''; ?>">
-                        <i class="fas fa-parking"></i> Quản lý slots
                     </a>
                 </li>
                 <li class="sidebar-item">

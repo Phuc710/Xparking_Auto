@@ -6,8 +6,8 @@ from email_handler import EmailHandler
 class DummyConfig:
     def __init__(self):
         self.config = {
-            "email_sender": "",          # Gmail gửi đi
-            "email_password": "",          # App password (16 ký tự, viết liền)
+            "email_sender": "Acc13422@gmail.com",          # Gmail gửi đi
+            "email_password": "onkqhepgezpafkts",          # App password (16 ký tự, viết liền)
             "email_recipient": "athanhphuc7102005@gmail.com"  # Mail nhận
         }
 

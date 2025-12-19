@@ -21,8 +21,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $smtp_config = [
     'host' => 'mail.xparking.elementfx.com',
     'port' => 587,
-    'username' => 'support@xparking.elementfx.com',
-    'password' => 'Thanhphuc0107@',
+    'username' => '',
+    'password' => '',
     'from_email' => 'support@xparking.elementfx.com',
     'from_name' => 'XParking Support'
 ];

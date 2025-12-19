@@ -193,7 +193,7 @@
 <script>
 document.addEventListener('DOMContentLoaded', function() {
     // Thay thế 'YOUR_OPENWEATHER_API_KEY' bằng mã API của bạn
-    const API_KEY = '09ec6782af2b6fdeec27b1fa7d4cfeaf';
+    const API_KEY = '';
     const weatherIcons = {
         '01d': { icon: 'fas fa-sun', color: '#fbbf24' }, // Clear sky (day)
         '01n': { icon: 'fas fa-moon', color: '#6b7280' }, // Clear sky (night)

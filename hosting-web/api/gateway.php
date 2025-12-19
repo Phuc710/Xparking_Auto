@@ -208,33 +208,34 @@ switch ($action) {
         ]);
         break;
 
-    // ========== VEHICLE ========== (dual gate)
+    // ========== VEHICLE ========== (GLOBAL SLOT COUNT)
     case 'checkin':
         $plate = strtoupper(ApiResponse::param('license_plate'));
-        $slot = ApiResponse::param('slot_id');
         $ticket = ApiResponse::param('ticket_code');
         $booking_id = ApiResponse::param('booking_id');
         
-        if (!$plate || !$slot) ApiResponse::error('Missing license_plate or slot_id');
+        if (!$plate) ApiResponse::error('Missing license_plate');
         
         try {
-            // Start transaction for atomic operations
             $db = db();
             $db->beginTransaction();
             
-            // Check slot availability (sử dụng index idx_parking_status)
-            $stmt = $db->prepare("SELECT status FROM parking_slots WHERE id = ? FOR UPDATE");
-            $stmt->execute([$slot]);
-            $slotData = $stmt->fetch();
+            // 1. Check global slot availability
+            $stmt = $db->prepare("SELECT `key`, value FROM settings WHERE `key` IN ('total_slots', 'occupied_slots') FOR UPDATE");
+            $stmt->execute();
+            $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
             
-            if (!$slotData || !in_array($slotData['status'], ['empty', 'reserved'])) {
+            $total = (int)($settings['total_slots'] ?? 50);
+            $occupied = (int)($settings['occupied_slots'] ?? 0);
+            
+            if ($occupied >= $total) {
                 $db->rollBack();
-                ApiResponse::error('Slot not available');
+                ApiResponse::error('Parking full - no available slots');
             }
             
             $entry_time = date('Y-m-d H:i:s');
             
-            // Find booking (sử dụng index idx_bookings_plate + idx_bookings_status)
+            // 2. Find booking if exists
             $final_booking_id = $booking_id;
             if (!$final_booking_id) {
                 $stmt = $db->prepare("SELECT id FROM bookings WHERE license_plate = ? AND status = 'confirmed' ORDER BY start_time ASC LIMIT 1");
@@ -243,20 +244,19 @@ switch ($action) {
                 $final_booking_id = $booking['id'] ?? null;
             }
             
-            // Insert vehicle (single query)
-            $stmt = $db->prepare("INSERT INTO vehicles (license_plate, slot_id, ticket_code, entry_time, status, booking_id) VALUES (?, ?, ?, ?, 'in_parking', ?)");
-            $stmt->execute([$plate, $slot, $ticket, $entry_time, $final_booking_id]);
+            // 3. Insert vehicle (no specific slot_id needed)
+            $stmt = $db->prepare("INSERT INTO vehicles (license_plate, ticket_code, entry_time, status, booking_id) VALUES (?, ?, ?, 'in_parking', ?)");
+            $stmt->execute([$plate, $ticket, $entry_time, $final_booking_id]);
             $vehicle_id = $db->lastInsertId();
             
-            // Update slot status
-            $stmt = $db->prepare("UPDATE parking_slots SET status = 'occupied' WHERE id = ?");
-            $stmt->execute([$slot]);
+            // 4. Increment occupied_slots (+1)
+            $stmt = $db->prepare("UPDATE settings SET value = CAST(CAST(value AS UNSIGNED) + 1 AS CHAR) WHERE `key` = 'occupied_slots'");
+            $stmt->execute();
             
-            // Update booking if exists
+            // 5. Update booking if exists
             if ($final_booking_id) {
-                // Chuyển status sang 'checked_in' để không còn tính là reserved nữa
-                $stmt = $db->prepare("UPDATE bookings SET status = 'checked_in', slot_id = ?, updated_at = NOW() WHERE id = ?");
-                $stmt->execute([$slot, $final_booking_id]);
+                $stmt = $db->prepare("UPDATE bookings SET status = 'checked_in', updated_at = NOW() WHERE id = ?");
+                $stmt->execute([$final_booking_id]);
             }
             
             $db->commit();
@@ -264,8 +264,10 @@ switch ($action) {
             ApiResponse::success([
                 'vehicle_id' => $vehicle_id,
                 'license_plate' => $plate,
-                'slot_id' => $slot,
-                'entry_time' => $entry_time
+                'ticket_code' => $ticket,
+                'entry_time' => $entry_time,
+                'occupied_slots' => $occupied + 1,
+                'available_slots' => $total - $occupied - 1
             ]);
         } catch (Exception $e) {
             if ($db->inTransaction()) $db->rollBack();
@@ -280,11 +282,10 @@ switch ($action) {
         if (!$ticket) ApiResponse::error('Missing ticket_code');
         
         try {
-            // Start transaction for atomic checkout
             $db = db();
             $db->beginTransaction();
             
-            // Get vehicle (sử dụng index idx_vehicles_ticket + idx_vehicles_status)
+            // 1. Get vehicle
             $stmt = $db->prepare("SELECT * FROM vehicles WHERE ticket_code = ? AND status = 'in_parking' FOR UPDATE");
             $stmt->execute([$ticket]);
             $vehicle = $stmt->fetch();
@@ -296,24 +297,22 @@ switch ($action) {
             
             $exit_time = date('Y-m-d H:i:s');
             
-            // Update vehicle status
+            // 2. Update vehicle status
             $stmt = $db->prepare("UPDATE vehicles SET exit_time = ?, status = 'exited' WHERE ticket_code = ?");
             $stmt->execute([$exit_time, $ticket]);
             
-            // Free slot
-            if ($vehicle['slot_id']) {
-                $stmt = $db->prepare("UPDATE parking_slots SET status = 'empty' WHERE id = ?");
-                $stmt->execute([$vehicle['slot_id']]);
-            }
+            // 3. Decrement occupied_slots (-1)
+            $stmt = $db->prepare("UPDATE settings SET value = CAST(GREATEST(CAST(value AS UNSIGNED) - 1, 0) AS CHAR) WHERE `key` = 'occupied_slots'");
+            $stmt->execute();
             
-            // Complete booking if exists
+            // 4. Complete booking if exists
             if ($vehicle['booking_id']) {
                 $stmt = $db->prepare("UPDATE bookings SET status = 'completed' WHERE id = ?");
                 $stmt->execute([$vehicle['booking_id']]);
             }
             
-            // Mark ticket as used
-            $stmt = $db->prepare("UPDATE tickets SET status = 'used', used_at = ? WHERE ticket_code = ?");
+            // 5. Mark ticket as USED
+            $stmt = $db->prepare("UPDATE tickets SET status = 'USED', time_out = ? WHERE ticket_code = ?");
             $stmt->execute([$exit_time, $ticket]);
             
             $db->commit();
@@ -341,19 +340,105 @@ switch ($action) {
         ApiResponse::error('Vehicle not found');
         break;
 
-    // ========== SLOTS ==========
-    case 'get_slots':
-        $slots = supabaseGetAll('parking_slots', '*', 'id');
-        ApiResponse::success(['slots' => $slots]);
+    // ========== SLOTS (SIMPLIFIED - Global Count) ==========
+    case 'get_slot_count':
+        try {
+            $db = db();
+            $stmt = $db->prepare("SELECT `key`, value FROM settings WHERE `key` IN ('total_slots', 'occupied_slots')");
+            $stmt->execute();
+            $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+            
+            $total = (int)($settings['total_slots'] ?? 50);
+            $occupied = (int)($settings['occupied_slots'] ?? 0);
+            $available = max(0, $total - $occupied);
+            
+            ApiResponse::success([
+                'total_slots' => $total,
+                'occupied_slots' => $occupied,
+                'available_slots' => $available
+            ]);
+        } catch (Exception $e) {
+            ApiResponse::error('get_slot_count failed: ' . $e->getMessage());
+        }
         break;
-        
-    case 'update_slot':
-        $id = ApiResponse::param('slot_id');
-        $status = ApiResponse::param('status');
-        if (!$id || !$status) ApiResponse::error('Missing slot_id or status');
-        
-        supabaseUpdate('parking_slots', 'id', $id, ['status' => $status]);
-        ApiResponse::success(['slot_id' => $id, 'status' => $status]);
+    
+    case 'increment_slot':
+        // Xe VÀO: +1
+        try {
+            $db = db();
+            $stmt = $db->prepare("UPDATE settings SET value = CAST(CAST(value AS UNSIGNED) + 1 AS CHAR) WHERE `key` = 'occupied_slots'");
+            $stmt->execute();
+            
+            // Return new count
+            $stmt = $db->prepare("SELECT `key`, value FROM settings WHERE `key` IN ('total_slots', 'occupied_slots')");
+            $stmt->execute();
+            $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+            
+            ApiResponse::success([
+                'total_slots' => (int)($settings['total_slots'] ?? 50),
+                'occupied_slots' => (int)($settings['occupied_slots'] ?? 0)
+            ]);
+        } catch (Exception $e) {
+            ApiResponse::error('increment_slot failed: ' . $e->getMessage());
+        }
+        break;
+    
+    case 'decrement_slot':
+        // Xe RA: -1
+        try {
+            $db = db();
+            
+            // Check if settings exist
+            $stmt = $db->prepare("SELECT COUNT(*) as cnt FROM settings WHERE `key` = 'occupied_slots'");
+            $stmt->execute();
+            $exists = $stmt->fetch()['cnt'] ?? 0;
+            
+            if ($exists == 0) {
+                // Insert default if not exists
+                $stmt = $db->prepare("INSERT INTO settings (`key`, value, description) VALUES ('occupied_slots', '0', 'Số chỗ đang sử dụng')");
+                $stmt->execute();
+            }
+            
+            // Decrement
+            $stmt = $db->prepare("UPDATE settings SET value = CAST(GREATEST(CAST(value AS UNSIGNED) - 1, 0) AS CHAR) WHERE `key` = 'occupied_slots'");
+            $result = $stmt->execute();
+            
+            if (!$result) {
+                error_log("decrement_slot UPDATE failed: " . json_encode($stmt->errorInfo()));
+                ApiResponse::error('Failed to update slot count');
+            }
+            
+            // Return new count
+            $stmt = $db->prepare("SELECT `key`, value FROM settings WHERE `key` IN ('total_slots', 'occupied_slots')");
+            $stmt->execute();
+            $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+            
+            ApiResponse::success([
+                'total_slots' => (int)($settings['total_slots'] ?? 50),
+                'occupied_slots' => (int)($settings['occupied_slots'] ?? 0)
+            ]);
+        } catch (Exception $e) {
+            error_log("decrement_slot exception: " . $e->getMessage() . " | " . $e->getTraceAsString());
+            ApiResponse::error('decrement_slot failed: ' . $e->getMessage());
+        }
+        break;
+    
+    case 'get_slots':
+        // Legacy - redirect to get_slot_count
+        try {
+            $db = db();
+            $stmt = $db->prepare("SELECT `key`, value FROM settings WHERE `key` IN ('total_slots', 'occupied_slots')");
+            $stmt->execute();
+            $settings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+            
+            $total = (int)($settings['total_slots'] ?? 50);
+            $occupied = (int)($settings['occupied_slots'] ?? 0);
+            
+            // Return dummy slot for compatibility
+            ApiResponse::success(['slots' => [['id' => 'SLOT', 'status' => $occupied < $total ? 'empty' : 'occupied']]]);
+        } catch (Exception $e) {
+            ApiResponse::error('get_slots failed');
+        }
         break;
 
     // ========== DEFAULT ==========
